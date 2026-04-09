@@ -50,3 +50,4 @@ boot/c-class.dtb
 boot/config.c-class
 
 boot/shakti.dtb
+*.mem*
