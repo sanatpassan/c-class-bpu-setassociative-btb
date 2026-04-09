@@ -230,7 +230,8 @@ module mkstage3#(parameter Bit#(`xlen) hartid) (Ifc_stage3);
 `ifdef gshare
   // on a misprediction, this register contains the reset global history value and whethr the btb
   // was a hit or miss during prediction.
-  Reg#(Maybe#(Tuple2#(Bool, Bit#(`histlen)))) wr_mispredict_ghr <- mkDReg( tagged Invalid);
+  // Reg#(Maybe#(Tuple2#(Bool, Bit#(`histlen)))) wr_mispredict_ghr <- mkDReg( tagged Invalid);
+  Wire#(Maybe#(Tuple2#(Bool, Bit#(`histlen)))) wr_mispredict_ghr <- mkDWire(tagged Invalid);
 `endif
 `endif
 
@@ -801,14 +802,14 @@ module mkstage3#(parameter Bit#(`xlen) hartid) (Ifc_stage3);
       if(btaken==1)begin
         case(prediction)
           'b00: prediction= 'b01;
-          'b01: prediction= 'b11;
+          'b01: prediction= 'b10;
           'b10: prediction= 'b11;
         endcase
       end
       else begin
         case(prediction)
           'b01:prediction= 'b00;
-          'b10:prediction= 'b00;
+          'b10:prediction= 'b01;
           'b11:prediction= 'b10;
         endcase
       end
@@ -860,7 +861,7 @@ module mkstage3#(parameter Bit#(`xlen) hartid) (Ifc_stage3);
     `endif
     `ifdef bpu 
       if (!trap && redirection)
-        wr_mispredict_ghr <= tagged Valid tuple2(btbresponse.btbhit, btbresponse.history);
+        wr_mispredict_ghr <= tagged Valid tuple2(btbresponse.btbhit && (td.ci == Branch), btbresponse.history);
       wr_training_data <= tagged Valid td;
     `endif
     `ifdef perfmonitors

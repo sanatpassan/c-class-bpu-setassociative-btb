@@ -26,6 +26,8 @@ package gshare_fa;
 `endif
 
   `define ignore 2
+  `define WAYS 16
+  typedef TDiv#(`btbdepth, `WAYS) NUM_SETS;
 
   // the following macro describes the number of banks the bht array is split into
   `ifdef compressed
@@ -50,7 +52,7 @@ package gshare_fa;
   instructions we have provided a 'hi' field in BTBEntry, which when true indicates that the higher
   instruction within the 4-byte address is a hit/trained */
   typedef struct{
-    Bit#(TSub#(`vaddr, 2)) tag;
+    Bit#(TSub#(`vaddr, TAdd#(TLog#(NUM_SETS), `ignore))) tag;
     Bool valid;
   } BTBTag deriving(Bits, Eq, FShow);
 
@@ -118,13 +120,13 @@ package gshare_fa;
 
     /*doc : vec : This vector of register holds the BTB entries. We use vector instead of array
     to leverage the select function provided by bluespec*/
-    Vector#(`btbdepth, Reg#(BTBEntry)) v_reg_btb_entry <-
-                                                  replicateM(mkReg(BTBEntry{target: ?, ci : Branch
-                                           `ifdef compressed ,instr16: False, hi:False `endif }));
+    Vector#(NUM_SETS, Vector#(`WAYS, Reg#(BTBEntry))) v_reg_btb_entry <-
+                                                  replicateM(replicateM(mkReg(BTBEntry{target: ?, ci : Branch
+                                           `ifdef compressed ,instr16: False, hi:False `endif })));
 
     /*doc : vec : This vector holds the BTB tags and the respecitve valid bits. This has been split
     from the BTB entries for better hw of CAM look-ups and index retrieval */
-    Vector#(`btbdepth, Reg#(BTBTag)) v_reg_btb_tag <- replicateM(mkReg(unpack(0)));
+    Vector#(NUM_SETS, Vector#(`WAYS, Reg#(BTBTag))) v_reg_btb_tag <- replicateM(replicateM(mkReg(unpack(0))));
 
     /*doc : reg : This array holds the branch history table. The bht table banked into `bhtcols
     banks. In case of compressed `bhtcols is 2 else 1. By banking it becomes easy to access the bht
@@ -144,7 +146,7 @@ package gshare_fa;
     Reg#(Bit#(TLog#(TDiv#(`bhtdepth, `bhtcols)))) rg_bht_index <- mkReg(0);
     /*doc : reg : This register points to the next entry in the Fully associative BTB that should
     be allocated for a new entry */
-    Reg#(Bit#(TLog#(`btbdepth))) rg_allocate <- mkReg(0);
+    Vector#(NUM_SETS, Reg#(Bit#(TLog#(`WAYS)))) rg_allocate <- replicateM(mkReg(0));
 
     /*doc : reg : This register holds the global history buffer. There are two methods which can
     update this register: mav_prediction_response and ma_mispredict. The former is called every
@@ -172,20 +174,22 @@ package gshare_fa;
     This rule would be called each time a fence.i is being performed. This rule will also reset the
     ghr and rg_allocate register*/
     rule rl_initialize (rg_initialize);
-      for(Integer i = 0; i < `btbdepth; i = i + 1)
-        v_reg_btb_tag[i]<=unpack(0);
+      for(Integer i = 0; i < valueOf(NUM_SETS); i = i + 1)
+        for(Integer w = 0; w < `WAYS; w = w + 1)
+          v_reg_btb_tag[i][w] <= unpack(0);
       for(Integer i = 0; i < `bhtcols ; i = i + 1)
         rg_bht_arr[i].upd(rg_bht_index,1);
       if (rg_bht_index == fromInteger(valueOf(TDiv#(`bhtdepth,`bhtcols))-1))
         rg_initialize <= False;
       rg_bht_index <= rg_bht_index + 1;
       rg_ghr[1] <= 0;
-      rg_allocate <= 0;
+      // rg_allocate <= 0;
+      for(Integer s = 0; s < valueOf(NUM_SETS); s = s + 1)
+        rg_allocate[s] <= 0;
     `ifdef bpu_ras
       ras_stack.clear;
     `endif
     endrule
-  `endif
 
     /*doc:method: This method provides prediction for a requested PC.
     If a fence.i is requested, then the rg_initialize register is set to true.
@@ -253,17 +257,19 @@ package gshare_fa;
     `endif
 
       if(!r.fence && wr_bpu_enable) begin
-        // a one - hot vector to store the hits of the btb
-        Bit#(`btbdepth) match_;
-        for(Integer i = 0; i < `btbdepth; i =  i + 1)
-          match_[i] = pack(v_reg_btb_tag[i].tag == truncateLSB(r.pc) && v_reg_btb_tag[i].valid);
+        let shifted_pc = r.pc >> `ignore;
+        Bit#(TLog#(NUM_SETS)) index = shifted_pc[valueOf(TLog#(NUM_SETS))-1:0];
+        Bit#(TSub#(`vaddr, TAdd#(TLog#(NUM_SETS), `ignore))) tag = truncateLSB(r.pc);
 
-        `logLevel( bpu, 1, $format("[%2d]BPU : Match:%h",hartid, match_))
+        Vector#(`WAYS, Bool) match_;
+        for(Integer i = 0; i < `WAYS; i = i + 1)
+          match_[i] = (v_reg_btb_tag[index][i].tag == tag && v_reg_btb_tag[index][i].valid);
 
-        hit = unpack(|match_);
-        let hit_entry = select(readVReg(v_reg_btb_entry), unpack(match_));
+        let match_bits = pack(match_);
+        hit = unpack(|match_bits);
+        let hit_entry = select(readVReg(v_reg_btb_entry[index]), unpack(match_bits));
 
-        if(|match_ == 1) begin
+        if(hit) begin
           `logLevel( bpu, 1, $format("[%2d]BPU : BTB Hit: ",hartid,fshow(hit_entry)))
         end
 
@@ -272,7 +278,7 @@ package gshare_fa;
           hi = hit_entry.hi;
         `endif
 
-        if(|match_ == 1) begin
+        if(hit) begin
         `ifdef bpu_ras
           `ifdef compressed
             Bit#(`vaddr) ras_push_offset = hit_entry.hi? hit_entry.instr16? r.discard? 2: 4
@@ -316,7 +322,7 @@ package gshare_fa;
                                                   bht_index_, target_, prediction_))
 
         `ifdef ASSERT
-          dynamicAssert(countOnes(match_) < 2, "Multiple Matches in BTB");
+          dynamicAssert(countOnes(match_bits) < 2, "Multiple Matches in BTB");
         `endif
       end
 
@@ -350,24 +356,28 @@ package gshare_fa;
                                                           `ifdef ifence && !rg_initialize `endif );
       `logLevel( bpu, 4, $format("[%2d]BPU : Received Training: ",hartid,fshow(d)))
 
-      function Bool fn_tag_match (BTBTag a);
-        return  (a.tag == truncateLSB(d.pc) && a.valid);
+      let shifted_pc = d.pc >> `ignore;
+      Bit#(TLog#(NUM_SETS)) set_idx = shifted_pc[valueOf(TLog#(NUM_SETS))-1:0];
+      Bit#(TSub#(`vaddr, TAdd#(TLog#(NUM_SETS), `ignore))) tag = truncateLSB(d.pc);
+      function Bool fn_way_match (BTBTag a);
+        return (a.tag == tag && a.valid);
       endfunction
 
-      let hit_index_ = findIndex(fn_tag_match, readVReg(v_reg_btb_tag));
+      let hit_index_ = findIndex(fn_way_match, readVReg(v_reg_btb_tag[set_idx]));
 
       if(hit_index_ matches tagged Valid .h) begin
-        v_reg_btb_entry[h] <= BTBEntry{ target : d.target, ci : d.ci
+        v_reg_btb_entry[set_idx][h] <= BTBEntry{ target : d.target, ci : d.ci
                             `ifdef compressed ,instr16: d.instr16, hi:unpack(d.pc[1]) `endif };
         `logLevel( bpu, 4, $format("[%2d]BPU : Training existing Entry index: %d",hartid,h))
       end
       else begin
-        `logLevel( bpu, 4, $format("[%2d]BPU : Allocating new index: %d",hartid,rg_allocate))
-        v_reg_btb_entry[rg_allocate] <= BTBEntry{ target : d.target, ci : d.ci
+        `logLevel( bpu, 4, $format("[%2d]BPU : Allocating new index: %d",hartid,rg_allocate[set_idx]))
+        Bit#(TLog#(`WAYS)) way = rg_allocate[set_idx];
+        v_reg_btb_entry[set_idx][way] <= BTBEntry{ target : d.target, ci : d.ci
                             `ifdef compressed ,instr16: d.instr16, hi:unpack(d.pc[1]) `endif };
-        v_reg_btb_tag[rg_allocate] <= BTBTag{tag: truncateLSB(d.pc), valid: True};
-        rg_allocate <= rg_allocate + 1;
-        if(v_reg_btb_tag[rg_allocate].valid)
+        v_reg_btb_tag[set_idx][way] <= BTBTag{tag: tag, valid: True};
+        rg_allocate[set_idx] <= rg_allocate[set_idx] + 1;
+        if(v_reg_btb_tag[set_idx][way].valid)
           `logLevel( bpu, 4, $format("[%2d]BPU : Conflict Detected",hartid))
       end
 
@@ -386,8 +396,9 @@ package gshare_fa;
     */
     method Action ma_mispredict (Tuple2#(Bool, Bit#(`histlen)) g)
                                                          `ifdef ifence if(!rg_initialize) `endif ;
-      let {btbhit, ghr} = g;
-      if(btbhit)
+      let {btbhit_and_branch, ghr} = g;
+      // `logLevel( bpu, 4, $format("[%2d]BPU : Incoming ghr:%h  btbhit_and_branch:%b  conflict_valid:%b  conflict_pred:%b", hartid, ghr, btbhit_and_branch, wr_bpu_conflict_valid, wr_bpu_conflict_pred))
+      if(btbhit_and_branch)
         ghr[`histlen-1] = ~ghr[`histlen-1];
       `logLevel( bpu, 4, $format("[%2d]BPU : Misprediction fired. Restoring ghr:%h",hartid,
                                                                                               ghr))
