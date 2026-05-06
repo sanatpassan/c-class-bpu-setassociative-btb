@@ -208,9 +208,9 @@ package TbSoc;
         rg_inst_count <= rg_inst_count + 1;
 
         if (idump.instruction[1:0] == 'b11)
-        	$fwrite(dump, "core   0: ", idump.mode, `ifdef hypervisor " %1d", idump.v, `endif `ifdef RV32 " 0x%8h" `else " 0x%16h" `endif , idump.pc, " (0x%8h", idump.instruction, ")");
+        	$fwrite(dump, $time, " core   0: ", idump.mode, `ifdef hypervisor " %1d", idump.v, `endif `ifdef RV32 " 0x%8h" `else " 0x%16h" `endif , idump.pc, " (0x%8h", idump.instruction, ")");
         else
-          $fwrite(dump, "core   0: ", idump.mode, `ifdef hypervisor " %1d", idump.v, `endif `ifdef RV32 " 0x%8h" `else " 0x%16h" `endif , idump.pc, " (0x%4h", idump.instruction[15:0], ")");
+          $fwrite(dump, $time , " core   0: ", idump.mode, `ifdef hypervisor " %1d", idump.v, `endif `ifdef RV32 " 0x%8h" `else " 0x%16h" `endif , idump.pc, " (0x%4h", idump.instruction[15:0], ")");
 
         if (idump.inst_type matches tagged REG .d) begin
 

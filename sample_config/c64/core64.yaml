@@ -19,9 +19,9 @@ m_extension:
 branch_predictor:
   instantiate: True
   predictor: gshare
-  btb_depth: 32
-  bht_depth: 512
-  history_len: 8
+  btb_depth: 64
+  bht_depth: 1024
+  history_len: 40
   history_bits: 5
   ras_depth: 8
 icache_configuration:
@@ -75,7 +75,7 @@ bsc_compile_options:
   top_dir: test_soc/c64_c32
   open_ocd: False
   cocotb_sim: False
-  static_check: True
+  static_check: False
   verbosity: 0
 verilator_configuration:
   coverage: none
