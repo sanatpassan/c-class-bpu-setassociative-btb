@@ -231,7 +231,7 @@ module mkstage3#(parameter Bit#(`xlen) hartid) (Ifc_stage3);
   // on a misprediction, this register contains the reset global history value and whethr the btb
   // was a hit or miss during prediction.
   // Reg#(Maybe#(Tuple2#(Bool, Bit#(`histlen)))) wr_mispredict_ghr <- mkDReg( tagged Invalid);
-  Wire#(Maybe#(Tuple2#(Bool, Bit#(`histlen)))) wr_mispredict_ghr <- mkDWire(tagged Invalid);
+  Wire#(Maybe#(Tuple3#(Bool, Bit#(`histlen), LoopHistory))) wr_mispredict_ghr <- mkDWire(tagged Invalid);
 `endif
 `endif
 
@@ -334,6 +334,7 @@ module mkstage3#(parameter Bit#(`xlen) hartid) (Ifc_stage3);
   Bool epochs_match = curr_epochs == meta.epochs;
 `ifdef bpu
   let btbresponse = meta.btbresponse;
+  let lp_hist = meta.lp_hist;
 `endif
   // ---------------------- Start local function definitions ----------------//
 
@@ -861,7 +862,7 @@ module mkstage3#(parameter Bit#(`xlen) hartid) (Ifc_stage3);
     `endif
     `ifdef bpu 
       if (!trap && redirection)
-        wr_mispredict_ghr <= tagged Valid tuple2(btbresponse.btbhit && (td.ci == Branch), btbresponse.history);
+        wr_mispredict_ghr <= tagged Valid tuple3(btbresponse.btbhit && (td.ci == Branch), btbresponse.history, lp_hist);
       wr_training_data <= tagged Valid td;
     `endif
     `ifdef perfmonitors
@@ -1115,7 +1116,7 @@ module mkstage3#(parameter Bit#(`xlen) hartid) (Ifc_stage3);
       return x;
     endmethod
   `ifdef gshare
-    method Tuple2#(Bool, Bit#(`histlen)) mv_mispredict if(wr_mispredict_ghr matches tagged Valid .x);
+    method Tuple3#(Bool, Bit#(`histlen), LoopHistory) mv_mispredict if(wr_mispredict_ghr matches tagged Valid .x);
       return x;
     endmethod
   `endif

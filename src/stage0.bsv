@@ -59,7 +59,7 @@ package stage0;
   `include "ccore_params.defines"
   import ccore_types :: * ;
 `ifdef bpu
-  import u_tage :: * ;
+  import u_tage_lp :: * ;
 `endif
 
   interface Ifc_stage0;
