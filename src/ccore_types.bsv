@@ -859,6 +859,8 @@ typedef struct{
     Bit#(`vaddr)  pc;
     Bit#(`vaddr)  target;
     Bit#(2)       state;
+    Bool          actual_taken;
+    LoopHistory lp_hist;
     ControlInsn   ci;
     Bool          btbhit;
   } Training_data deriving (Bits, Eq, FShow);

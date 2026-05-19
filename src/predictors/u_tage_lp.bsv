@@ -59,9 +59,9 @@ package u_tage_lp;
   } TaggedEntry#(numeric type tag_w) deriving (Bits, Eq, FShow);
 
   // Loop Predictor Constants
-  `define LOOP_ENTRIES 32
+  `define LOOP_ENTRIES 16
   `define LOOP_CONF_MAX 7
-  `define ITER_WIDTH 10 // Supports loops up to 1024 iterations
+  `define ITER_WIDTH 10 
   `define TRIP_WIDTH 10
 
   typedef struct {
@@ -144,6 +144,10 @@ package u_tage_lp;
     return truncate(pc >> (`ignore + 1)) ^ folded_h;
   endfunction
 
+  function Bool is_evictable(LoopEntry e);
+      return !e.valid || (e.confidence == 0);
+  endfunction
+
   interface Ifc_bpu;
     /*doc : method : receive the request of new pc and return the next pc in case of hit. */
     method ActionValue#(PredictionResponse) mav_prediction_response (PredictionRequest r);
@@ -222,7 +226,7 @@ package u_tage_lp;
     Vector#(NUM_SETS, Reg#(Bit#(TLog#(`WAYS)))) rg_allocate <- replicateM(mkReg(0));
 
     // --- Loop Predictor State ---
-    Vector#(`LOOP_ENTRIES, Reg#(LoopEntry)) v_reg_loop_table <- replicateM(mkReg(unpack(0)));
+    Vector#(`LOOP_ENTRIES, Array#(Reg#(LoopEntry))) v_reg_loop_table <- replicateM(mkCReg(2, LoopEntry{valid: False, tag: 0, trip_count: 0, iter_count: 0, confidence: 0, direction: 0}));
     Reg#(Bit#(TLog#(`LOOP_ENTRIES))) rg_loop_alloc_ptr <- mkReg(0);
 
     /*doc : reg : This register holds the global history buffer. There are two methods which can
@@ -420,28 +424,34 @@ package u_tage_lp;
               // 2. Loop Predictor Parallel Lookup
               Bit#(TSub#(`vaddr, `ignore)) lp_tag = truncate(r.pc >> `ignore);
               for(Integer i=0; i < `LOOP_ENTRIES; i=i+1) begin
-                if(v_reg_loop_table[i].valid && v_reg_loop_table[i].tag == lp_tag) begin
+                if(v_reg_loop_table[i][0].valid && v_reg_loop_table[i][0].tag == lp_tag) begin
                   lp_hit = True;
-                  let ent = v_reg_loop_table[i];
+                  let ent = v_reg_loop_table[i][0];
                   lv_lp_hist.idx = fromInteger(i);
                   lv_lp_hist.count = ent.iter_count;
                   
+                  Bool is_confident = False;
                   // Prediction Logic: If iter_count + 1 == trip_count, predict EXIT
                   if(ent.trip_count > 0 && ent.confidence >= 2) begin
-                      Bool is_confident = (ent.confidence == `LOOP_CONF_MAX) || 
-                                          (ent.confidence >= 2 && ent.trip_count > 10);
+                      is_confident = (ent.confidence == `LOOP_CONF_MAX);
                       
                       if(is_confident) begin
-                        if(ent.iter_count + 1 == ent.trip_count)
+                        if(ent.iter_count == ent.trip_count - 1)
                           lp_taken = ~ent.direction;
                         else
                           lp_taken = ent.direction;
                         
                         // OVERRIDE TAGE
-                        prediction_ = {lp_taken, 1'b1}; // Mapping to a weak/strong state
+                        prediction_ = {lp_taken, 1'b1}; 
                         tage_taken = lp_taken;
                       end
                   end
+                  // 3. SPECULATIVE UPDATE: Increment count NOW for the next fetch cycle
+                  if (tage_taken == ent.direction)
+                      ent.iter_count = ent.iter_count + 1;
+                  else
+                      ent.iter_count = 0;
+                  v_reg_loop_table[i][0] <= ent; 
                 end
               end
                 
@@ -550,8 +560,7 @@ package u_tage_lp;
             original_provider_state = ent1.state;
         end
 
-        // Define actual vs predicted based on your state logic
-        Bool actual_taken = (d.state > original_provider_state) || (d.state == 3);
+        Bool actual_taken = d.actual_taken;
         Bool predicted_taken = unpack(original_provider_state[`statesize-1]);
         Bool mispredict = (predicted_taken != actual_taken);
 
@@ -560,52 +569,93 @@ package u_tage_lp;
         Maybe#(Bit#(TLog#(`LOOP_ENTRIES))) maybe_lp_idx = tagged Invalid;
         
         for(Integer i = 0; i < `LOOP_ENTRIES; i = i + 1) begin
-            if(v_reg_loop_table[i].valid && v_reg_loop_table[i].tag == lp_tag)
+            if(v_reg_loop_table[i][1].valid && v_reg_loop_table[i][1].tag == lp_tag)
                 maybe_lp_idx = tagged Valid fromInteger(i);
         end
 
-        if(maybe_lp_idx matches tagged Valid .idx) begin
-            let ent = v_reg_loop_table[idx];
-            if(actual_taken != unpack(ent.direction)) begin // Loop Exit detected
-                if(ent.iter_count + 1 == ent.trip_count) begin
-                    // Success! Loop finished exactly when expected
+        if(maybe_lp_idx matches tagged Valid .idx &&& d.ci == Branch) begin
+            let ent = v_reg_loop_table[idx][1];
+            // Determine if history is valid based on your signed index sentinel (-1)
+            Bool history_valid = (d.lp_hist.idx >= 0);
+            // 1. Evaluate Confidence & Trip Counts
+            if(actual_taken != unpack(ent.direction)) begin // Loop Exit
+                if(history_valid && (d.lp_hist.count + 1 == ent.trip_count)) begin
                     ent.confidence = (ent.confidence < `LOOP_CONF_MAX) ? ent.confidence + 1 : ent.confidence;
-                end else begin
-                    // Trip count was wrong, update it and penalize confidence
-                    ent.trip_count = ent.iter_count + 1;
+                end else if (history_valid) begin
+                    ent.trip_count = d.lp_hist.count + 1; // Real trip count calculation!
                     ent.confidence = (ent.confidence > 0) ? ent.confidence - 1 : 0;
                 end
                 ent.iter_count = 0;
-            end else begin // Loop Body execution
-                ent.iter_count = ent.iter_count + 1;
-                // If loop runs longer than known trip_count, it's no longer a stable loop
-                if(ent.trip_count > 0 && ent.iter_count >= ent.trip_count)
-                    ent.confidence = (ent.confidence > 0) ? ent.confidence - 1 : 0;
             end
-            v_reg_loop_table[idx] <= ent;
+            else begin // Loop Continues
+                if(history_valid && ent.trip_count > 0 && d.lp_hist.count >= ent.trip_count) begin
+                    ent.confidence = (ent.confidence > 0) ? ent.confidence - 1 : 0;
+                end
+            end
+
+            // 2. Structural Fix: Recover iter_count based on True Architectural Outcome
+            if(actual_taken != unpack(ent.direction)) begin
+                ent.iter_count = 0; // Loop physically ended -> Reset to 0 for next invocation
+            end else begin
+                if(mispredict) begin
+                    ent.iter_count = d.lp_hist.count + 1; // Mispredicted exit -> Restore correct next iteration
+                end else begin
+                    let live_ent = v_reg_loop_table[idx][1]; // Predicted correctly -> Retain front-end speculative value
+                    ent.iter_count = live_ent.iter_count;
+                end
+            end
+
+            v_reg_loop_table[idx][1] <= ent;
         end 
-        else if (mispredict) begin // Allocation only happens on misprediction
-            let ptr = rg_loop_alloc_ptr;
-            v_reg_loop_table[ptr] <= LoopEntry{
-                tag: lp_tag, trip_count: 0, iter_count: 0, 
-                confidence: 0, direction: pack(actual_taken), valid: True
-            };
-            rg_loop_alloc_ptr <= rg_loop_alloc_ptr + 1;
+        else if (mispredict) begin 
+            // 2. SEARCH for a "weak" victim
+            Vector#(`LOOP_ENTRIES, LoopEntry) v_loop_snapshot;
+            for(Integer i = 0; i < `LOOP_ENTRIES; i = i + 1)
+                v_loop_snapshot[i] = v_reg_loop_table[i][1];
+
+            let victim_idx = findIndex(is_evictable, v_loop_snapshot);
+            
+            // 3. ONLY replace if a victim was found
+            if (victim_idx matches tagged Valid .v) begin
+                Bit#(TLog#(`LOOP_ENTRIES)) alloc_ptr = pack(v);
+                Bit#(1) body_dir = (d.target < d.pc) ? 1'b1 : 1'b0;
+                
+                v_reg_loop_table[alloc_ptr][1] <= LoopEntry{
+                    tag: lp_tag, 
+                    trip_count: 0, 
+                    iter_count: 0, 
+                    confidence: 0, 
+                    direction: body_dir, 
+                    valid: True
+                };
+            end 
+            else begin
+                // Trigger a "Decay" to make room for future allocations.
+                for(Integer i = 0; i < `LOOP_ENTRIES; i = i + 1) begin
+                    let ent = v_reg_loop_table[i][1];
+                    if(ent.confidence > 0) begin
+                        ent.confidence = ent.confidence - 1;
+                        v_reg_loop_table[i][1] <= ent;
+                    end
+                end
+                `logLevel(bpu, 4, $format("[%2d]BPU : LP Table Full. Decaying confidence.", hartid))
+            end
         end
 
-        // --- TAGE UPDATE LOGIC (Only if btbhit) ---
+        // --- TAGE UPDATE LOGIC ---
         if(d.btbhit) begin
+          Bit#(`statesize) next_tage_state;
+          if (actual_taken) 
+              next_tage_state = (original_provider_state == 3) ? 3 : original_provider_state + 1;
+          else 
+              next_tage_state = (original_provider_state == 0) ? 0 : original_provider_state - 1;
           // Update the state of the provider table with the actual state computed by the Execute stage
-          if(provider == 3) rf_tagged_3[hi_bank].upd(idx3, TaggedEntry{state: d.state, tag: t3, valid: True});
-          else if(provider == 2) rf_tagged_2[hi_bank].upd(idx2, TaggedEntry{state: d.state, tag: t2, valid: True});
-          else if(provider == 1) rf_tagged_1[hi_bank].upd(idx1, TaggedEntry{state: d.state, tag: t1, valid: True});
-          else rg_bht_base[hi_bank].upd(idx0, d.state);
-
-          // Allocate a new entry on a misprediction
-          // Bool actual_taken = (d.state > original_provider_state) || (d.state == 3);
-          // Bool predicted_taken = unpack(original_provider_state[`statesize-1]);
+          if(provider == 3) rf_tagged_3[hi_bank].upd(idx3, TaggedEntry{state: next_tage_state, tag: t3, valid: True});
+          else if(provider == 2) rf_tagged_2[hi_bank].upd(idx2, TaggedEntry{state: next_tage_state, tag: t2, valid: True});
+          else if(provider == 1) rf_tagged_1[hi_bank].upd(idx1, TaggedEntry{state: next_tage_state, tag: t1, valid: True});
+          else rg_bht_base[hi_bank].upd(idx0, next_tage_state);
           
-          if(predicted_taken != actual_taken && provider < 3) begin
+          if(mispredict && provider < 3) begin
             // Initialize new entry to weakly taken (2) or weakly not-taken (1)
             Bit#(`statesize) init_st = actual_taken ? 2 : 1;
             
@@ -629,18 +679,6 @@ package u_tage_lp;
       `logLevel( bpu, 4, $format("[%2d]BPU : Misprediction fired. Restoring ghr:%h",hartid,
                                                                                               ghr))
       rg_ghr[1] <= ghr;
-
-      // If the branch that mispredicted was tracked by the Loop Predictor (idx != -1)
-      if(lp_hist.idx >= 0) begin
-        Bit#(TLog#(`LOOP_ENTRIES)) table_idx = truncate(pack(lp_hist.idx));
-        let ent = v_reg_loop_table[table_idx];
-        
-        // RESTORE the iteration count to the snapshot taken during prediction
-        ent.iter_count = lp_hist.count; 
-        v_reg_loop_table[table_idx] <= ent;
-        
-        `logLevel(bpu, 4, $format("[%2d]BPU : Restoring Loop Index %d to Count %d", hartid, table_idx, lp_hist.count))
-      end
     endmethod
 
     method Action ma_bpu_enable (Bool e);
@@ -649,6 +687,5 @@ package u_tage_lp;
 
   endmodule
 endpackage
-
 
 

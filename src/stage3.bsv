@@ -780,7 +780,9 @@ module mkstage3#(parameter Bit#(`xlen) hartid) (Ifc_stage3);
     end
     let td = Training_data{pc : meta.pc,
                            target : jump_address,
-                           state  : ?
+                           state  : ?,
+                           actual_taken : (btaken == 1),
+                           lp_hist : lp_hist
                         `ifdef gshare
                            ,history   : btbresponse.history
                         `endif
