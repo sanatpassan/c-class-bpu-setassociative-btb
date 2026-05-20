@@ -52,7 +52,7 @@ interface Ifc_s0_bpu;
   method Action ma_train_bpu (Training_data td);
 `ifdef gshare
   /*doc : method: This method is fired when there is a conditional misprediction */
-  method Action ma_mispredict (Tuple3#(Bool, Bit#(`histlen), LoopHistory) g);
+  method Action ma_mispredict (Tuple2#(Bool, Bit#(`histlen)) g);
 `endif
   /*doc : method: This method captures if the bpu is enabled through csr or not*/
   method Action ma_bpu_enable (Bool e);
@@ -196,7 +196,7 @@ interface Ifc_s3_bpu;
   method Training_data mv_train_bpu;
   // This method sends out the return - address to be pushed on top of the stack.
 `ifdef gshare
-  method Tuple3#(Bool, Bit#(`histlen), LoopHistory) mv_mispredict;
+  method Tuple2#(Bool, Bit#(`histlen)) mv_mispredict;
 `endif
 endinterface:Ifc_s3_bpu
 `endif

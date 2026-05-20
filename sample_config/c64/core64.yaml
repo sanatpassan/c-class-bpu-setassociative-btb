@@ -19,9 +19,9 @@ m_extension:
 branch_predictor:
   instantiate: True
   predictor: gshare
-  btb_depth: 64
-  bht_depth: 1024
-  history_len: 40
+  btb_depth: 32
+  bht_depth: 512
+  history_len: 8
   history_bits: 5
   ras_depth: 8
 icache_configuration:

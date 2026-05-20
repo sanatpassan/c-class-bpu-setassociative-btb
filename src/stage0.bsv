@@ -59,7 +59,7 @@ package stage0;
   `include "ccore_params.defines"
   import ccore_types :: * ;
 `ifdef bpu
-  import u_tage_lp :: * ;
+  import gshare_fa :: * ;
 `endif
 
   interface Ifc_stage0;
@@ -237,7 +237,7 @@ package stage0;
             `ifdef hypervisor !rg_hfence[0] && `endif True) begin
           tx_tostage1.u.enq(Stage0PC{   address      : rg_pc[0] & signExtend(3'b100)
                     `ifdef compressed   ,discard     : rg_pc[0][1]==1        `endif
-                    `ifdef bpu          ,btbresponse : bpu_resp.btbresponse, lp_hist : bpu_resp.lp_hist `endif  });
+                    `ifdef bpu          ,btbresponse : bpu_resp.btbresponse `ifdef bpu_lp ,lp_hist : bpu_resp.lp_hist `endif `endif  });
           `logLevel( stage0, 0, $format("[%2d]STAGE0: Sending PC:%h to Stage1",hartid, rg_pc[0]))
         end
     endrule

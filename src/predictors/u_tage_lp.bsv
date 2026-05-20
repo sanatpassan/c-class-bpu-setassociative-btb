@@ -161,7 +161,7 @@ package u_tage_lp;
     The second field contains the GHR value after predicting the same instruction. In case
     of a conditional branch the LSB bit of this GHR is negated and this value is restored in the
     rg_ghr register. Otherwise, the GHR directly written to the rg_ghr register. */
-    method Action ma_mispredict (Tuple3#(Bool, Bit#(`histlen), LoopHistory) g);
+    method Action ma_mispredict (Tuple2#(Bool, Bit#(`histlen)) g);
 
     /*doc : method : This method captures if the bpu is enabled through csr or not*/
     method Action ma_bpu_enable (Bool e);
@@ -671,9 +671,9 @@ package u_tage_lp;
     the misprediction was due to a conditional branch then the ghr is fixed by flipping the lsb
     and then writing it to the rg_ghr.
     */
-    method Action ma_mispredict (Tuple3#(Bool, Bit#(`histlen), LoopHistory) g)
+    method Action ma_mispredict (Tuple2#(Bool, Bit#(`histlen)) g)
                                                          `ifdef ifence if(!rg_initialize) `endif ;
-      let {btbhit_and_branch, ghr, lp_hist} = g;
+      let {btbhit_and_branch, ghr} = g;
       if(btbhit_and_branch)
         ghr[`histlen-1] = ~ghr[`histlen-1];
       `logLevel( bpu, 4, $format("[%2d]BPU : Misprediction fired. Restoring ghr:%h",hartid,

@@ -348,7 +348,7 @@ module mkstage2#(parameter Bit#(`xlen) hartid) (Ifc_stage2);
                   `ifdef spfpu ,rdtype      : decoded.op_type.rdtype `endif
                   `ifdef RV64  , word32     :     word32
                   `elsif dpfpu , word32     :     word32 `endif
-                            `ifdef bpu                , btbresponse:  btbresponse, lp_hist : rx_pipe1.u.first.lp_hist
+                            `ifdef bpu                , btbresponse:  btbresponse `ifdef bpu_lp ,lp_hist : rx_pipe1.u.first.lp_hist `endif
                                 `ifdef compressed     , compressed : compressed `endif
                             `endif };
 

@@ -372,7 +372,9 @@ typedef struct{
 `endif
 `ifdef bpu
   BTBResponse btbresponse;
-  LoopHistory lp_hist;
+  `ifdef bpu_lp
+    LoopHistory lp_hist;
+  `endif
 `endif
   Bit#(addr)  address;      // XLEN:0
 } Stage0PC#(numeric type addr) deriving(Bits, Eq, FShow);
@@ -385,7 +387,9 @@ typedef struct{
 `endif
 `ifdef bpu
   BTBResponse btbresponse;
-  LoopHistory lp_hist;
+  `ifdef bpu_lp
+    LoopHistory lp_hist;
+  `endif
 `endif
 	Bit#(`vaddr) program_counter;
 	Bit#(32) instruction;
@@ -412,7 +416,9 @@ typedef struct{
     Bool compressed;
   `endif
   BTBResponse btbresponse;
-  LoopHistory lp_hist;
+  `ifdef bpu_lp
+    LoopHistory lp_hist;
+  `endif
 `endif
   Bool is_microtrap;
   Bit#(TMax#(`causesize, 7)) funct;
@@ -846,7 +852,9 @@ typedef struct{
   `endif
     Bit#(`vaddr) nextpc;
     BTBResponse btbresponse;
+  `ifdef bpu_lp
     LoopHistory lp_hist;
+  `endif
   }PredictionResponse deriving (Bits, Eq, FShow);
 
   typedef struct {
@@ -859,8 +867,10 @@ typedef struct{
     Bit#(`vaddr)  pc;
     Bit#(`vaddr)  target;
     Bit#(2)       state;
+  `ifdef bpu_lp
     Bool          actual_taken;
     LoopHistory lp_hist;
+  `endif
     ControlInsn   ci;
     Bool          btbhit;
   } Training_data deriving (Bits, Eq, FShow);

@@ -368,7 +368,7 @@ package stage1;
                     epochs:{rg_eEpoch, rg_wEpoch},
                     trap : trap
                   `ifdef bpu
-                    ,btbresponse: btbresponse, lp_hist : stage0pc.lp_hist
+                    ,btbresponse: btbresponse `ifdef bpu_lp ,lp_hist : stage0pc.lp_hist `endif
                   `endif
                   `ifdef compressed
                     ,upper_err : rg_receiving_upper && imem_resp.trap

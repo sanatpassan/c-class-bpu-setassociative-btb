@@ -26,7 +26,12 @@ package gshare_fa;
 `endif
 
   `define ignore 2
+  // the following macro determines whether the BTB is set-associative and the number of ways  
+  `ifdef btb_set_assoc
   `define WAYS 16
+  `else
+  `define WAYS `btbdepth
+  `endif
   typedef TDiv#(`btbdepth, `WAYS) NUM_SETS;
 
   // the following macro describes the number of banks the bht array is split into
@@ -46,13 +51,14 @@ package gshare_fa;
   `endif
   } BTBEntry deriving(Bits, Eq, FShow);
 
-  /*doc:struct: This struct holds the tag and valid bit of each BTB entry.
+  /*doc:struct: This struct holds the tag and valid bit of each BTB entry. Tag length changes according
+  to BTB set-associative configuration.
   Each entry corresponds to a tag for a 4-byte aligned address. This means that this tag can be a
   hit of at-most 2 instructions when compressed is supported. To distinguish between the 2
   instructions we have provided a 'hi' field in BTBEntry, which when true indicates that the higher
   instruction within the 4-byte address is a hit/trained */
   typedef struct{
-    Bit#(TSub#(`vaddr, TAdd#(TLog#(NUM_SETS), `ignore))) tag;
+    Bit#(TSub#(`vaddr, TAdd#(TLog#(NUM_SETS), `ignore))) tag;  
     Bool valid;
   } BTBTag deriving(Bits, Eq, FShow);
 
@@ -83,6 +89,17 @@ package gshare_fa;
     Bit#(TLog#(TDiv#(`bhtdepth,`bhtcols))) hist_hash = zeroExtend(_h << (valueOf(TLog#(`bhtdepth)) - `histbits));
     return pc_hash ^ hist_hash;
   endfunction
+
+  /*function Bit#(TLog#(TDiv#(`bhtdepth,`bhtcols))) fn_hash_basic (
+                                      Bit#(`histlen) history, Bit#(`vaddr) pc);
+    
+    Bit#(TLog#(TDiv#(`bhtdepth,`bhtcols))) pc_hash = 
+            truncate(pc >> `ignore); 
+          ^ zeroExtend((pc >> (`ignore + valueOf(TLog#(TDiv#(`bhtdepth,`bhtcols)))))[4:0]);
+    Bit#(`histbits) _h = truncateLSB(history);
+    Bit#(TLog#(TDiv#(`bhtdepth,`bhtcols))) hist_hash = zeroExtend(history);
+    return pc_hash ^ hist_hash;
+  endfunction*/
 
   interface Ifc_bpu;
     /*doc : method : receive the request of new pc and return the next pc in case of hit. */
@@ -118,7 +135,7 @@ package gshare_fa;
     Ifc_stack#(`vaddr, `rasdepth) ras_stack <- mkstack;
   `endif
 
-    /*doc : vec : This vector of register holds the BTB entries. We use vector instead of array
+    /*doc : vec : This vector of vector holds the BTB entries. We use vector instead of array
     to leverage the select function provided by bluespec*/
     Vector#(NUM_SETS, Vector#(`WAYS, Reg#(BTBEntry))) v_reg_btb_entry <-
                                                   replicateM(replicateM(mkReg(BTBEntry{target: ?, ci : Branch
@@ -144,7 +161,7 @@ package gshare_fa;
     end
     /*doc:reg: */
     Reg#(Bit#(TLog#(TDiv#(`bhtdepth, `bhtcols)))) rg_bht_index <- mkReg(0);
-    /*doc : reg : This register points to the next entry in the Fully associative BTB that should
+    /*doc : reg : This vector points to the next entry in the Fully associative BTB that should
     be allocated for a new entry */
     Vector#(NUM_SETS, Reg#(Bit#(TLog#(`WAYS)))) rg_allocate <- replicateM(mkReg(0));
 
@@ -183,13 +200,13 @@ package gshare_fa;
         rg_initialize <= False;
       rg_bht_index <= rg_bht_index + 1;
       rg_ghr[1] <= 0;
-      // rg_allocate <= 0;
       for(Integer s = 0; s < valueOf(NUM_SETS); s = s + 1)
         rg_allocate[s] <= 0;
     `ifdef bpu_ras
       ras_stack.clear;
     `endif
     endrule
+  `endif
 
     /*doc:method: This method provides prediction for a requested PC.
     If a fence.i is requested, then the rg_initialize register is set to true.
@@ -197,14 +214,15 @@ package gshare_fa;
     The index of the bht is obtained using the hash function above on the pc and the current value
     of GHR. This index is then used to find the entry in the BHT.
 
-    We then perform a fully-associative look-up on the BTB. We compare the tags with the pc and
-    check for the valid bit to be set. This applied to each entry and a corresponding bit is set in
-    match_ variable. By nature of how training and prediction is performed, we expect match_
-    variable to be a one-hot vector i.e. only one entry is a hit in the entire BTB. Multiple entries
-    can't be a hit since update comes from only one source.
+    We then perform a set-associative look-up on the BTB. The PC is first split into index bits (select 
+    the BTB set) and tag bits (compared within the selected set). Using the index, we access one BTB set 
+    and perform parallel tag comparison across all WAYS of that set. Tag comparison is performed across 
+    all WAYS of the indexed set. The match_ vector indicates which way matches the tag. By nature of how 
+    training and prediction is performed, we expect match_ vector to be a one-hot vector within the 
+    selected set i.e. only one entry is a hit in the BTB set. Multiple entries can't be a hit since 
+    update comes from only one source.
 
-    Then using the match_ variable and the special select function from BSV we pick out the entry
-    that is a hit. A hit is detected only is OR(match) != 0.
+    Using the match_ vector and BSV's select function, the matching way inside the indexed set is chosen.
 
     Depending on the ci type the prediction variable is set either to 3 or the value in the BHT
     entry that we indexed earlier.
@@ -258,7 +276,11 @@ package gshare_fa;
 
       if(!r.fence && wr_bpu_enable) begin
         let shifted_pc = r.pc >> `ignore;
-        Bit#(TLog#(NUM_SETS)) index = shifted_pc[valueOf(TLog#(NUM_SETS))-1:0];
+        `ifdef btb_set_assoc
+          Bit#(TLog#(NUM_SETS)) index = shifted_pc[valueOf(TLog#(NUM_SETS))-1:0];
+        `else
+          Bit#(TLog#(NUM_SETS)) index = 0;
+        `endif
         Bit#(TSub#(`vaddr, TAdd#(TLog#(NUM_SETS), `ignore))) tag = truncateLSB(r.pc);
 
         Vector#(`WAYS, Bool) match_;
@@ -335,11 +357,13 @@ package gshare_fa;
     endmethod
 
     /*doc:method: This method is called for all unconditional and conditional jumps.
-    Using the pc of the instruction we first check if the entry already exists in the btb or not. If
-    it does then entry is updated with a new/same target from the execute stage.
+    Using the pc of the instruction we first compute the BTB index and tag. The index selects the 
+    BTB set and the tag is used to match entries within that set. If an entry already exists in the 
+    indexed set (tag match and valid bit set), then the entry is updated with a new/same target 
+    from the execute stage.
 
-    If the entry does not exists then a new entry is allotted in the btb depending on rg_allocate
-    value.
+    If the entry does not exist, then a new entry is allotted in the BTB set depending on the 
+    rg_allocate[set_idx] value. This acts as a per-set allocation pointer for replacement among the WAYS.
 
     Additionally in case of conditional branches, the bht is again indexed using the pc and the ghr.
     This entry is updated only if the BTB was a hit during prediction i.e. only on the second
@@ -357,7 +381,11 @@ package gshare_fa;
       `logLevel( bpu, 4, $format("[%2d]BPU : Received Training: ",hartid,fshow(d)))
 
       let shifted_pc = d.pc >> `ignore;
-      Bit#(TLog#(NUM_SETS)) set_idx = shifted_pc[valueOf(TLog#(NUM_SETS))-1:0];
+      `ifdef btb_set_assoc
+        Bit#(TLog#(NUM_SETS)) set_idx = shifted_pc[valueOf(TLog#(NUM_SETS))-1:0];
+      `else
+        Bit#(TLog#(NUM_SETS)) set_idx = 0;
+      `endif
       Bit#(TSub#(`vaddr, TAdd#(TLog#(NUM_SETS), `ignore))) tag = truncateLSB(d.pc);
       function Bool fn_way_match (BTBTag a);
         return (a.tag == tag && a.valid);
@@ -397,7 +425,6 @@ package gshare_fa;
     method Action ma_mispredict (Tuple2#(Bool, Bit#(`histlen)) g)
                                                          `ifdef ifence if(!rg_initialize) `endif ;
       let {btbhit_and_branch, ghr} = g;
-      // `logLevel( bpu, 4, $format("[%2d]BPU : Incoming ghr:%h  btbhit_and_branch:%b  conflict_valid:%b  conflict_pred:%b", hartid, ghr, btbhit_and_branch, wr_bpu_conflict_valid, wr_bpu_conflict_pred))
       if(btbhit_and_branch)
         ghr[`histlen-1] = ~ghr[`histlen-1];
       `logLevel( bpu, 4, $format("[%2d]BPU : Misprediction fired. Restoring ghr:%h",hartid,

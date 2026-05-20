@@ -228,10 +228,9 @@ module mkstage3#(parameter Bit#(`xlen) hartid) (Ifc_stage3);
   Reg#(Maybe#(Training_data)) wr_training_data <- mkDReg(tagged Invalid);
   // Wire to send the return - address on the stack.
 `ifdef gshare
-  // on a misprediction, this register contains the reset global history value and whethr the btb
+  // on a misprediction, this wire contains the reset global history value and whether the btb
   // was a hit or miss during prediction.
-  // Reg#(Maybe#(Tuple2#(Bool, Bit#(`histlen)))) wr_mispredict_ghr <- mkDReg( tagged Invalid);
-  Wire#(Maybe#(Tuple3#(Bool, Bit#(`histlen), LoopHistory))) wr_mispredict_ghr <- mkDWire(tagged Invalid);
+  Wire#(Maybe#(Tuple2#(Bool, Bit#(`histlen)))) wr_mispredict_ghr <- mkDWire(tagged Invalid);
 `endif
 `endif
 
@@ -334,7 +333,9 @@ module mkstage3#(parameter Bit#(`xlen) hartid) (Ifc_stage3);
   Bool epochs_match = curr_epochs == meta.epochs;
 `ifdef bpu
   let btbresponse = meta.btbresponse;
-  let lp_hist = meta.lp_hist;
+  `ifdef bpu_lp
+    let lp_hist = meta.lp_hist;
+  `endif
 `endif
   // ---------------------- Start local function definitions ----------------//
 
@@ -767,6 +768,8 @@ module mkstage3#(parameter Bit#(`xlen) hartid) (Ifc_stage3);
 
     nextpc - offset is calculated in the following way, because jump_address is 
     aligned to 2 incase of JALR.
+    Changed BHT update logic to standard +/-1 saturating counter.
+    Previous transitions skipped states; this version shows better prediction results.
     */
     case ({base[0],offset[0]}) 
 	    'b00: nextpc = nextpc - truncate(offset); 
@@ -780,9 +783,11 @@ module mkstage3#(parameter Bit#(`xlen) hartid) (Ifc_stage3);
     end
     let td = Training_data{pc : meta.pc,
                            target : jump_address,
-                           state  : ?,
-                           actual_taken : (btaken == 1),
-                           lp_hist : lp_hist
+                           state  : ?
+                        `ifdef bpu_lp
+                           ,actual_taken : (btaken == 1)
+                           ,lp_hist : lp_hist
+                        `endif
                         `ifdef gshare
                            ,history   : btbresponse.history
                         `endif
@@ -864,7 +869,7 @@ module mkstage3#(parameter Bit#(`xlen) hartid) (Ifc_stage3);
     `endif
     `ifdef bpu 
       if (!trap && redirection)
-        wr_mispredict_ghr <= tagged Valid tuple3(btbresponse.btbhit && (td.ci == Branch), btbresponse.history, lp_hist);
+        wr_mispredict_ghr <= tagged Valid tuple2(btbresponse.btbhit && (td.ci == Branch), btbresponse.history);
       wr_training_data <= tagged Valid td;
     `endif
     `ifdef perfmonitors
@@ -1118,7 +1123,7 @@ module mkstage3#(parameter Bit#(`xlen) hartid) (Ifc_stage3);
       return x;
     endmethod
   `ifdef gshare
-    method Tuple3#(Bool, Bit#(`histlen), LoopHistory) mv_mispredict if(wr_mispredict_ghr matches tagged Valid .x);
+    method Tuple2#(Bool, Bit#(`histlen)) mv_mispredict if(wr_mispredict_ghr matches tagged Valid .x);
       return x;
     endmethod
   `endif
