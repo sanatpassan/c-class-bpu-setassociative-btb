@@ -434,7 +434,7 @@ package u_tage_lp;
               let hit_idx = findIndex(is_lp_hit, v_loop_snapshot);
 
               if(hit_idx matches tagged Valid .idx) begin
-                  let ent = v_loop_snapshot[idx][0];
+                  let ent = v_loop_snapshot[idx];
                   lv_lp_hist.idx = unpack(signExtend(pack(idx)));
                   lv_lp_hist.count = ent.iter_count;
                   
