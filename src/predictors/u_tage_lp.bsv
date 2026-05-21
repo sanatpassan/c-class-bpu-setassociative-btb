@@ -423,11 +423,19 @@ package u_tage_lp;
 
               // 2. Loop Predictor Parallel Lookup
               Bit#(TSub#(`vaddr, `ignore)) lp_tag = truncate(r.pc >> `ignore);
-              for(Integer i=0; i < `LOOP_ENTRIES; i=i+1) begin
-                if(v_reg_loop_table[i][0].valid && v_reg_loop_table[i][0].tag == lp_tag) begin
-                  lp_hit = True;
-                  let ent = v_reg_loop_table[i][0];
-                  lv_lp_hist.idx = fromInteger(i);
+              Vector#(`LOOP_ENTRIES, LoopEntry) v_loop_snapshot;
+
+              for(Integer i = 0; i < `LOOP_ENTRIES; i = i + 1)
+                  v_loop_snapshot[i] = v_reg_loop_table[i][0];
+
+              function Bool is_lp_hit(LoopEntry ent);
+                  return (ent.valid && ent.tag == lp_tag);
+              endfunction
+              let hit_idx = findIndex(is_lp_hit, v_loop_snapshot);
+
+              if(hit_idx matches tagged Valid .idx) begin
+                  let ent = v_loop_snapshot[idx][0];
+                  lv_lp_hist.idx = unpack(signExtend(pack(idx)));
                   lv_lp_hist.count = ent.iter_count;
                   
                   Bool is_confident = False;
@@ -451,9 +459,8 @@ package u_tage_lp;
                       ent.iter_count = ent.iter_count + 1;
                   else
                       ent.iter_count = 0;
-                  v_reg_loop_table[i][0] <= ent; 
+                  v_reg_loop_table[idx][0] <= ent; 
                 end
-              end
                 
               lv_ghr = {tage_taken, truncateLSB(rg_ghr[0])};
               `logLevel( bpu, 0, $format("[%2d]BPU : New GHR:%h",hartid, lv_ghr))
