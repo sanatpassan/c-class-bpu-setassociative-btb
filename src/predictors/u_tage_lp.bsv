@@ -60,7 +60,7 @@ package u_tage_lp;
 
   // Loop Predictor Constants
   `define LOOP_ENTRIES 16
-  `define LOOP_CONF_MAX 7
+  `define LOOP_CONF_MAX 3
   `define ITER_WIDTH 10 
   `define TRIP_WIDTH 10
 
@@ -340,8 +340,6 @@ package u_tage_lp;
     `endif
 
       Bit#(1) lp_taken = 0;
-      Bool lp_hit = False;
-      Bit#(3) lp_conf = 0;
       LoopHistory lv_lp_hist = LoopHistory { idx: -1, count: 0 };
 
       if(!r.fence && wr_bpu_enable) begin
@@ -440,19 +438,14 @@ package u_tage_lp;
                   
                   Bool is_confident = False;
                   // Prediction Logic: If iter_count + 1 == trip_count, predict EXIT
-                  if(ent.trip_count > 0 && ent.confidence >= 2) begin
-                      is_confident = (ent.confidence == `LOOP_CONF_MAX);
-                      
-                      if(is_confident) begin
-                        if(ent.iter_count == ent.trip_count - 1)
-                          lp_taken = ~ent.direction;
-                        else
-                          lp_taken = ent.direction;
-                        
-                        // OVERRIDE TAGE
-                        prediction_ = {lp_taken, 1'b1}; 
-                        tage_taken = lp_taken;
-                      end
+                  if(ent.trip_count > 0 && ent.confidence == `LOOP_CONF_MAX) begin
+                      if(ent.iter_count == ent.trip_count - 1)
+                        lp_taken = ~ent.direction;
+                      else
+                        lp_taken = ent.direction;
+                      // OVERRIDE TAGE
+                      prediction_ = {lp_taken, 1'b1}; 
+                      tage_taken = lp_taken;
                   end
                   // 3. SPECULATIVE UPDATE: Increment count NOW for the next fetch cycle
                   if (tage_taken == ent.direction)
@@ -568,7 +561,7 @@ package u_tage_lp;
         end
 
         Bool actual_taken = d.actual_taken;
-        Bool predicted_taken = unpack(original_provider_state[`statesize-1]);
+        Bool predicted_taken = unpack(d.final_pred[`statesize-1]);
         Bool mispredict = (predicted_taken != actual_taken);
 
         // --- LOOP PREDICTOR TRAINING ---

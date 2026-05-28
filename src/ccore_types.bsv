@@ -869,6 +869,7 @@ typedef struct{
     Bit#(2)       state;
   `ifdef bpu_lp
     Bool          actual_taken;
+    Bit#(`statesize) final_pred;
     LoopHistory lp_hist;
   `endif
     ControlInsn   ci;

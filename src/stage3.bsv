@@ -786,6 +786,7 @@ module mkstage3#(parameter Bit#(`xlen) hartid) (Ifc_stage3);
                            state  : ?
                         `ifdef bpu_lp
                            ,actual_taken : (btaken == 1)
+                           ,final_pred : btbresponse.prediction
                            ,lp_hist : lp_hist
                         `endif
                         `ifdef gshare
