@@ -289,7 +289,37 @@ package gshare_fa;
 
         let match_bits = pack(match_);
         hit = unpack(|match_bits);
-        let hit_entry = select(readVReg(v_reg_btb_entry[index]), unpack(match_bits));
+
+        // =================================================================
+        // OPTIMIZATION 1: FAST BITWISE CONTROL EXTRACTION
+        // =================================================================
+        Vector#(`WAYS, Bool) way_is_branch = replicate(False);
+        Vector#(`WAYS, Bool) way_is_call   = replicate(False);
+        Vector#(`WAYS, Bool) way_is_ret    = replicate(False);
+        Vector#(`WAYS, Bool) way_is_jal    = replicate(False);
+        Vector#(`WAYS, Bool) way_is_hi     = replicate(False);
+
+        let btb_entries = readVReg(v_reg_btb_entry[index]);
+        for(Integer i = 0; i < `WAYS; i = i + 1) begin
+            way_is_branch[i] = (btb_entries[i].ci == Branch);
+            way_is_call[i]   = (btb_entries[i].ci == Call);
+            way_is_ret[i]    = (btb_entries[i].ci == Ret);
+            way_is_jal[i]    = (btb_entries[i].ci == JAL);
+            way_is_hi[i]     = btb_entries[i].hi;
+        end
+
+        Bool hit_branch = unpack(|(match_bits & pack(way_is_branch)));
+        Bool hit_call   = unpack(|(match_bits & pack(way_is_call)));
+        Bool hit_ret    = unpack(|(match_bits & pack(way_is_ret)));
+        Bool hit_jal    = unpack(|(match_bits & pack(way_is_jal)));
+
+        let hit_entry = select(btb_entries, unpack(match_bits));
+
+        Bool late_hi = False;
+        `ifdef compressed
+          late_hi = hit ? unpack(|(match_bits & pack(way_is_hi))) : hit_entry.hi;
+        `endif
+        hi = late_hi;
 
         if(hit) begin
           `logLevel( bpu, 1, $format("[%2d]BPU : BTB Hit: ",hartid,fshow(hit_entry)))
@@ -297,46 +327,54 @@ package gshare_fa;
 
         `ifdef compressed
           instr16 = hit_entry.instr16;
-          hi = hit_entry.hi;
         `endif
 
-        if(hit) begin
+        // Clean Structural Guard Logic to decouple dependencies
+        Bool process_prediction = True;
         `ifdef bpu_ras
           `ifdef compressed
-            Bit#(`vaddr) ras_push_offset = hit_entry.hi? hit_entry.instr16? r.discard? 2: 4
+            if (!(late_hi || !r.discard)) process_prediction = False;
+          `endif
+        `endif
+
+        if(hit && process_prediction) begin
+        `ifdef bpu_ras
+          `ifdef compressed
+            Bit#(`vaddr) ras_push_offset = late_hi? hit_entry.instr16? r.discard? 2: 4
                                                                           : r.discard? 4: 6
                                                        : hit_entry.instr16? 2: 4;
           `else
             Bit#(`vaddr) ras_push_offset = 4;
           `endif
-        if(True `ifdef compressed && ( hit_entry.hi || !r.discard ) `endif ) begin
-          if(hit_entry.ci == Call)begin // push to ras in case of Call instructions
+
+          if(hit_call) begin // push to ras in case of Call instructions
             Bit#(`vaddr) push_pc = r.pc + ras_push_offset;
             `logLevel( bpu, 1, $format("[%2d]BPU: Pushing1 to RAS:%h",hartid,(push_pc)))
             ras_stack.push(push_pc);
+            target_ = hit_entry.target;
           end
-
-          if(hit_entry.ci == Ret) begin // pop from ras in case of Ret instructions
+          else if(hit_ret) begin // pop from ras in case of Ret instructions
             target_ = ras_stack.top;
             ras_stack.pop;
             `logLevel( bpu, 1, $format("[%2d]BPU: Choosing from top RAS:%h",hartid,target_))
           end
-          else
-        `endif
+          else begin
+            target_ = hit_entry.target;
+          end
+        `else
           target_ = hit_entry.target;
+        `endif
 
-          // update only if hi is True or if discard is false. No point in predicting dicarded inst.
-            if(hit_entry.ci == Ret ||  hit_entry.ci == Call || hit_entry.ci == JAL )
+            if(hit_ret || hit_call || hit_jal)
                prediction_ = 3;
 
-            if(hit_entry.ci == Branch) begin
-              prediction_ = branch_state_[pack(hi)];
+            if(hit_branch) begin
+              prediction_ = branch_state_[pack(late_hi)];
               lv_ghr = {prediction_[`statesize - 1], truncateLSB(rg_ghr[0])};
               `logLevel( bpu, 0, $format("[%2d]BPU : New GHR:%h",hartid, lv_ghr))
             end
-          end
-
         end
+
       `ifdef ifence if(!r.fence) `endif
           rg_ghr[0] <= lv_ghr;
 
@@ -387,26 +425,52 @@ package gshare_fa;
         Bit#(TLog#(NUM_SETS)) set_idx = 0;
       `endif
       Bit#(TSub#(`vaddr, TAdd#(TLog#(NUM_SETS), `ignore))) tag = truncateLSB(d.pc);
-      function Bool fn_way_match (BTBTag a);
-        return (a.tag == tag && a.valid);
-      endfunction
 
-      let hit_index_ = findIndex(fn_way_match, readVReg(v_reg_btb_tag[set_idx]));
+      // =================================================================
+      // OPTIMIZATION 3: STATIC PARALLEL LOCALIZATION FOR BTB TRAINING
+      // =================================================================
+      for (Integer s = 0; s < valueOf(NUM_SETS); s = s + 1) begin
+        Bit#(TLog#(NUM_SETS)) current_set = fromInteger(s);
+        Bool set_match = (set_idx == current_set);
 
-      if(hit_index_ matches tagged Valid .h) begin
-        v_reg_btb_entry[set_idx][h] <= BTBEntry{ target : d.target, ci : d.ci
-                            `ifdef compressed ,instr16: d.instr16, hi:unpack(d.pc[1]) `endif };
-        `logLevel( bpu, 4, $format("[%2d]BPU : Training existing Entry index: %d",hartid,h))
-      end
-      else begin
-        `logLevel( bpu, 4, $format("[%2d]BPU : Allocating new index: %d",hartid,rg_allocate[set_idx]))
-        Bit#(TLog#(`WAYS)) way = rg_allocate[set_idx];
-        v_reg_btb_entry[set_idx][way] <= BTBEntry{ target : d.target, ci : d.ci
-                            `ifdef compressed ,instr16: d.instr16, hi:unpack(d.pc[1]) `endif };
-        v_reg_btb_tag[set_idx][way] <= BTBTag{tag: tag, valid: True};
-        rg_allocate[set_idx] <= rg_allocate[set_idx] + 1;
-        if(v_reg_btb_tag[set_idx][way].valid)
-          `logLevel( bpu, 4, $format("[%2d]BPU : Conflict Detected",hartid))
+        Maybe#(Bit#(TLog#(`WAYS))) local_hit_idx = tagged Invalid;
+        for (Integer w = 0; w < valueOf(`WAYS); w = w + 1) begin
+          let tag_val = v_reg_btb_tag[s][w];
+          if (tag_val.tag == tag && tag_val.valid) begin
+            local_hit_idx = tagged Valid fromInteger(w);
+          end
+        end
+
+        Bit#(TLog#(`WAYS)) alloc_way = rg_allocate[s];
+
+        for (Integer w = 0; w < valueOf(`WAYS); w = w + 1) begin
+          Bit#(TLog#(`WAYS)) current_way = fromInteger(w);
+
+          if (set_match) begin
+            if (local_hit_idx matches tagged Valid .h) begin
+              if (h == current_way) begin
+                v_reg_btb_entry[s][w] <= BTBEntry{ target : d.target, ci : d.ci
+                                    `ifdef compressed ,instr16: d.instr16, hi:unpack(d.pc[1]) `endif };
+                `logLevel( bpu, 4, $format("[%2d]BPU : Training existing Entry index: %d",hartid,h))
+              end
+            end
+            else begin
+              if (alloc_way == current_way) begin
+                v_reg_btb_entry[s][w] <= BTBEntry{ target : d.target, ci : d.ci
+                                    `ifdef compressed ,instr16: d.instr16, hi:unpack(d.pc[1]) `endif };
+                v_reg_btb_tag[s][w]   <= BTBTag{tag: tag, valid: True};
+                
+                `logLevel( bpu, 4, $format("[%2d]BPU : Allocating new index: %d",hartid,alloc_way))
+                if(v_reg_btb_tag[s][w].valid)
+                  `logLevel( bpu, 4, $format("[%2d]BPU : Conflict Detected",hartid))
+              end
+            end
+          end
+        end
+
+        if (set_match && !isValid(local_hit_idx)) begin
+          rg_allocate[s] <= rg_allocate[s] + 1;
+        end
       end
 
       // we use the ghr version before the prediction to train the BHT

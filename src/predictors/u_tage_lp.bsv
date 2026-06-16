@@ -144,9 +144,9 @@ package u_tage_lp;
     return truncate(pc >> (`ignore + 1)) ^ folded_h;
   endfunction
 
-  function Bool is_evictable(LoopEntry e);
-      return !e.valid || (e.confidence == 0);
-  endfunction
+  // function Bool is_evictable(LoopEntry e);
+  //     return !e.valid || (e.confidence == 0);
+  // endfunction
 
   interface Ifc_bpu;
     /*doc : method : receive the request of new pc and return the next pc in case of hit. */
@@ -321,9 +321,9 @@ package u_tage_lp;
     function would also benefit from this mechanism.
     */
     method ActionValue#(PredictionResponse) mav_prediction_response (PredictionRequest r)
-                                                         `ifdef ifence if(!rg_initialize) `endif ;
-      `logLevel( bpu, 0, $format("[%2d]BPU : Received Request: ",hartid, fshow(r),
-                                 " ghr:%h",hartid,rg_ghr[0]))
+                                                        `ifdef ifence if(!rg_initialize) `endif ;
+    `logLevel( bpu, 0, $format("[%2d]BPU : Received Request: ",hartid, fshow(r),
+                               " ghr:%h",hartid,rg_ghr[0]))
     `ifdef ifence
       if( r.fence && wr_bpu_enable)
         rg_initialize <= True;
@@ -353,7 +353,37 @@ package u_tage_lp;
 
         let match_bits = pack(match_);
         hit = unpack(|match_bits);
-        let hit_entry = select(readVReg(v_reg_btb_entry[index]), unpack(match_bits));
+        
+        // =================================================================
+        // TIMING OPTIMIZATION 1: FAST BITWISE CONTROL EXTRACTION
+        // =================================================================
+        Vector#(`WAYS, Bool) way_is_branch = replicate(False);
+        Vector#(`WAYS, Bool) way_is_call   = replicate(False);
+        Vector#(`WAYS, Bool) way_is_ret    = replicate(False);
+        Vector#(`WAYS, Bool) way_is_jal    = replicate(False);
+        Vector#(`WAYS, Bool) way_is_hi     = replicate(False);
+
+        let btb_entries = readVReg(v_reg_btb_entry[index]);
+        for(Integer i = 0; i < `WAYS; i = i + 1) begin
+            way_is_branch[i] = (btb_entries[i].ci == Branch);
+            way_is_call[i]   = (btb_entries[i].ci == Call);
+            way_is_ret[i]    = (btb_entries[i].ci == Ret);
+            way_is_jal[i]    = (btb_entries[i].ci == JAL);
+            way_is_hi[i]     = btb_entries[i].hi;
+        end
+
+        Bool hit_branch = unpack(|(match_bits & pack(way_is_branch)));
+        Bool hit_call   = unpack(|(match_bits & pack(way_is_call)));
+        Bool hit_ret    = unpack(|(match_bits & pack(way_is_ret)));
+        Bool hit_jal    = unpack(|(match_bits & pack(way_is_jal)));
+        
+        let hit_entry = select(btb_entries, unpack(match_bits));
+
+        Bool late_hi = False;
+        `ifdef compressed
+          late_hi = hit ? unpack(|(match_bits & pack(way_is_hi))) : hit_entry.hi;
+        `endif
+        hi = late_hi;
 
         if(hit) begin
           `logLevel( bpu, 1, $format("[%2d]BPU : BTB Hit: ",hartid,fshow(hit_entry)))
@@ -361,105 +391,145 @@ package u_tage_lp;
 
         `ifdef compressed
           instr16 = hit_entry.instr16;
-          hi = hit_entry.hi;
         `endif
 
-        if(hit) begin
+        Bit#(TSub#(`vaddr, `ignore)) lp_tag = truncate(r.pc >> `ignore);
+
+        // =================================================================
+        // PASS 1: PURE READ & OVERRIDE GENERATION (FEED-FORWARD ONLY)
+        // =================================================================
+        Bool lp_override_active = False;
+        Bit#(`statesize) lp_override_pred = 1;
+        Bit#(1) lp_override_taken = 0;
+
+        for(Integer i = 0; i < `LOOP_ENTRIES; i = i + 1) begin
+            let ent = v_reg_loop_table[i][0];
+            Bool is_lp_match = (ent.valid && ent.tag == lp_tag);
+
+            if (is_lp_match) begin
+                lv_lp_hist.idx = fromInteger(i);
+                lv_lp_hist.count = ent.iter_count;
+
+                if(ent.trip_count > 0 && ent.confidence == `LOOP_CONF_MAX) begin
+                    lp_override_active = True;
+                    Bit#(1) predicted_dir = (ent.iter_count == ent.trip_count - 1) ? ~ent.direction : ent.direction;
+                    lp_override_taken = predicted_dir;
+                    lp_override_pred  = {predicted_dir, 1'b1};
+                end
+            end
+        end
+
+        // =================================================================
+        // PASS 2: ISOLATED WRITE-BACK (GATED BY TIMING-OPTIMIZED hit_branch)
+        // =================================================================
+        for(Integer i = 0; i < `LOOP_ENTRIES; i = i + 1) begin
+            let ent = v_reg_loop_table[i][0];
+            Bool is_lp_match = (ent.valid && ent.tag == lp_tag);
+
+            if (hit_branch && is_lp_match) begin
+                let updated_ent = ent;
+                
+                if(ent.trip_count > 0 && ent.confidence == `LOOP_CONF_MAX) begin
+                    Bit#(1) predicted_dir = (ent.iter_count == ent.trip_count - 1) ? ~ent.direction : ent.direction;
+                    if (predicted_dir == ent.direction)
+                        updated_ent.iter_count = ent.iter_count + 1;
+                    else
+                        updated_ent.iter_count = 0;
+                end 
+                else begin
+                    updated_ent.iter_count = ent.iter_count + 1;
+                end
+                
+                v_reg_loop_table[i][0] <= updated_ent;
+            end
+        end
+
+        // =================================================================
+        // TIMING OPTIMIZATION 2: PARALLEL SPECULATIVE TAGE LOOKUPS
+        // =================================================================
+        let idx0 = fn_get_index(rg_ghr[0], r.pc, 0);
+        let idx1 = fn_get_index(rg_ghr[0], r.pc, 10);
+        let idx2 = fn_get_index(rg_ghr[0], r.pc, 20);
+        let idx3 = fn_get_index(rg_ghr[0], r.pc, 40);
+
+        let tag1 = fn_get_tag(rg_ghr[0], r.pc, 10);
+        let tag2 = fn_get_tag(rg_ghr[0], r.pc, 20);
+        let tag3 = fn_get_tag(rg_ghr[0], r.pc, 40);
+
+        // Speculative lookup for Bank 0
+        let ent1_0 = rf_tagged_1[0].sub(idx1);
+        let ent2_0 = rf_tagged_2[0].sub(idx2);
+        let ent3_0 = rf_tagged_3[0].sub(idx3);
+
+        Bit#(`statesize) pred_hi0 = rg_bht_base[0].sub(idx0);
+        if(ent3_0.valid && ent3_0.tag == tag3)      pred_hi0 = ent3_0.state;
+        else if(ent2_0.valid && ent2_0.tag == tag2) pred_hi0 = ent2_0.state;
+        else if(ent1_0.valid && ent1_0.tag == tag1) pred_hi0 = ent1_0.state;
+
+        // Speculative lookup for Bank 1
+        let ent1_1 = rf_tagged_1[1].sub(idx1);
+        let ent2_1 = rf_tagged_2[1].sub(idx2);
+        let ent3_1 = rf_tagged_3[1].sub(idx3);
+
+        Bit#(`statesize) pred_hi1 = rg_bht_base[1].sub(idx0);
+        if(ent3_1.valid && ent3_1.tag == tag3)      pred_hi1 = ent3_1.state;
+        else if(ent2_1.valid && ent2_1.tag == tag2) pred_hi1 = ent2_1.state;
+        else if(ent1_1.valid && ent1_1.tag == tag1) pred_hi1 = ent1_1.state;
+
+        // =================================================================
+        // CLEAN STRUCTURAL PREDICTION GUARD
+        // =================================================================
+        Bool process_prediction = True;
         `ifdef bpu_ras
           `ifdef compressed
-            Bit#(`vaddr) ras_push_offset = hit_entry.hi? hit_entry.instr16? r.discard? 2: 4
-                                                                          : r.discard? 4: 6
+            if (!(late_hi || !r.discard)) process_prediction = False;
+          `endif
+        `endif
+
+        if(hit && process_prediction) begin
+        `ifdef bpu_ras
+          `ifdef compressed
+            Bit#(`vaddr) ras_push_offset = late_hi? hit_entry.instr16? r.discard? 2: 4
+                                                          : r.discard? 4: 6
                                                        : hit_entry.instr16? 2: 4;
           `else
             Bit#(`vaddr) ras_push_offset = 4;
           `endif
-        if(True `ifdef compressed && ( hit_entry.hi || !r.discard ) `endif ) begin
-          if(hit_entry.ci == Call)begin // push to ras in case of Call instructions
+
+          if(hit_call) begin 
             Bit#(`vaddr) push_pc = r.pc + ras_push_offset;
             `logLevel( bpu, 1, $format("[%2d]BPU: Pushing1 to RAS:%h",hartid,(push_pc)))
             ras_stack.push(push_pc);
+            target_ = hit_entry.target;
           end
-
-          if(hit_entry.ci == Ret) begin // pop from ras in case of Ret instructions
+          else if(hit_ret) begin 
             target_ = ras_stack.top;
             ras_stack.pop;
             `logLevel( bpu, 1, $format("[%2d]BPU: Choosing from top RAS:%h",hartid,target_))
           end
-          else
-        `endif
+          else begin
+            target_ = hit_entry.target;
+          end
+        `else
           target_ = hit_entry.target;
+        `endif
 
-          // update only if hi is True or if discard is false. No point in predicting dicarded inst.
-            if(hit_entry.ci == Ret ||  hit_entry.ci == Call || hit_entry.ci == JAL )
+            if(hit_ret || hit_call || hit_jal)
                prediction_ = 3;
 
-            if(hit_entry.ci == Branch) begin
-              // Calculate all possible hits
-              let idx0 = fn_get_index(rg_ghr[0], r.pc, 0);
-              let idx1 = fn_get_index(rg_ghr[0], r.pc, 10);
-              let idx2 = fn_get_index(rg_ghr[0], r.pc, 20);
-              let idx3 = fn_get_index(rg_ghr[0], r.pc, 40);
-
-              let tag1 = fn_get_tag(rg_ghr[0], r.pc, 10);
-              let tag2 = fn_get_tag(rg_ghr[0], r.pc, 20);
-              let tag3 = fn_get_tag(rg_ghr[0], r.pc, 40);
-
-              let ent1 = rf_tagged_1[pack(hi)].sub(idx1);
-              let ent2 = rf_tagged_2[pack(hi)].sub(idx2);
-              let ent3 = rf_tagged_3[pack(hi)].sub(idx3);
-
-              // Priority Lookup (Longest history first)
-              if(ent3.valid && ent3.tag == tag3)
-                prediction_ = ent3.state;
-              else if(ent2.valid && ent2.tag == tag2)
-                prediction_ = ent2.state;
-              else if(ent1.valid && ent1.tag == tag1)
-                prediction_ = ent1.state;
-              else
-                prediction_ = rg_bht_base[pack(hi)].sub(idx0);
+            if(hit_branch) begin
+              prediction_ = late_hi ? pred_hi1 : pred_hi0;
+              
               Bit#(1) tage_taken = prediction_[`statesize - 1];
 
-              // 2. Loop Predictor Parallel Lookup
-              Bit#(TSub#(`vaddr, `ignore)) lp_tag = truncate(r.pc >> `ignore);
-              Vector#(`LOOP_ENTRIES, LoopEntry) v_loop_snapshot;
-
-              for(Integer i = 0; i < `LOOP_ENTRIES; i = i + 1)
-                  v_loop_snapshot[i] = v_reg_loop_table[i][0];
-
-              function Bool is_lp_hit(LoopEntry ent);
-                  return (ent.valid && ent.tag == lp_tag);
-              endfunction
-              let hit_idx = findIndex(is_lp_hit, v_loop_snapshot);
-
-              if(hit_idx matches tagged Valid .idx) begin
-                  let ent = v_loop_snapshot[idx];
-                  lv_lp_hist.idx = unpack(signExtend(pack(idx)));
-                  lv_lp_hist.count = ent.iter_count;
-                  
-                  Bool is_confident = False;
-                  // Prediction Logic: If iter_count + 1 == trip_count, predict EXIT
-                  if(ent.trip_count > 0 && ent.confidence == `LOOP_CONF_MAX) begin
-                      if(ent.iter_count == ent.trip_count - 1)
-                        lp_taken = ~ent.direction;
-                      else
-                        lp_taken = ent.direction;
-                      // OVERRIDE TAGE
-                      prediction_ = {lp_taken, 1'b1}; 
-                      tage_taken = lp_taken;
-                  end
-                  // 3. SPECULATIVE UPDATE: Increment count NOW for the next fetch cycle
-                  if (tage_taken == ent.direction)
-                      ent.iter_count = ent.iter_count + 1;
-                  else
-                      ent.iter_count = 0;
-                  v_reg_loop_table[idx][0] <= ent; 
-                end
+              if (lp_override_active) begin
+                  prediction_ = lp_override_pred;
+                  tage_taken  = lp_override_taken;
+              end
                 
               lv_ghr = {tage_taken, truncateLSB(rg_ghr[0])};
               `logLevel( bpu, 0, $format("[%2d]BPU : New GHR:%h",hartid, lv_ghr))
             end
-          end
-
         end
       `ifdef ifence if(!r.fence) `endif
           rg_ghr[0] <= lv_ghr;
@@ -505,30 +575,61 @@ package u_tage_lp;
       let shifted_pc = d.pc >> `ignore;
       Bit#(TLog#(NUM_SETS)) set_idx = shifted_pc[valueOf(TLog#(NUM_SETS))-1:0];
       Bit#(TSub#(`vaddr, TAdd#(TLog#(NUM_SETS), `ignore))) tag = truncateLSB(d.pc);
-      function Bool fn_way_match (BTBTag a);
-        return (a.tag == tag && a.valid);
-      endfunction
 
-      let hit_index_ = findIndex(fn_way_match, readVReg(v_reg_btb_tag[set_idx]));
+      // STATIC PARALLEL LOCALIZATION: Completely eliminates 2D Mux/Demux trees
+      for (Integer s = 0; s < valueOf(NUM_SETS); s = s + 1) begin
+        Bit#(TLog#(NUM_SETS)) current_set = fromInteger(s);
+        Bool set_match = (set_idx == current_set);
 
-      if(hit_index_ matches tagged Valid .h) begin
-        v_reg_btb_entry[set_idx][h] <= BTBEntry{ target : d.target, ci : d.ci
-                            `ifdef compressed ,instr16: d.instr16, hi:unpack(d.pc[1]) `endif };
-        `logLevel( bpu, 4, $format("[%2d]BPU : Training existing Entry index: %d",hartid,h))
-      end
-      else begin
-        `logLevel( bpu, 4, $format("[%2d]BPU : Allocating new index: %d",hartid,rg_allocate[set_idx]))
-        Bit#(TLog#(`WAYS)) way = rg_allocate[set_idx];
-        v_reg_btb_entry[set_idx][way] <= BTBEntry{ target : d.target, ci : d.ci
-                            `ifdef compressed ,instr16: d.instr16, hi:unpack(d.pc[1]) `endif };
-        v_reg_btb_tag[set_idx][way] <= BTBTag{tag: tag, valid: True};
-        rg_allocate[set_idx] <= rg_allocate[set_idx] + 1;
-        if(v_reg_btb_tag[set_idx][way].valid)
-          `logLevel( bpu, 4, $format("[%2d]BPU : Conflict Detected",hartid))
+        // 1. Statically look up hits inside this specific set
+        Maybe#(Bit#(TLog#(`WAYS))) local_hit_idx = tagged Invalid;
+        for (Integer w = 0; w < valueOf(`WAYS); w = w + 1) begin
+          let tag_val = v_reg_btb_tag[s][w];
+          if (tag_val.tag == tag && tag_val.valid) begin
+            local_hit_idx = tagged Valid fromInteger(w);
+          end
+        end
+
+        // 2. Fetch allocation pointer for this set
+        Bit#(TLog#(`WAYS)) alloc_way = rg_allocate[s];
+
+        // 3. Update arrays locally per register element
+        for (Integer w = 0; w < valueOf(`WAYS); w = w + 1) begin
+          Bit#(TLog#(`WAYS)) current_way = fromInteger(w);
+
+          if (set_match) begin
+            if (local_hit_idx matches tagged Valid .h) begin
+              // If it's a hit, only update the matching way
+              if (h == current_way) begin
+                v_reg_btb_entry[s][w] <= BTBEntry{ target : d.target, ci : d.ci
+                                    `ifdef compressed ,instr16: d.instr16, hi:unpack(d.pc[1]) `endif };
+              end
+            end
+            else begin
+              // If it's a miss, only update the allocated way
+              if (alloc_way == current_way) begin
+                v_reg_btb_entry[s][w] <= BTBEntry{ target : d.target, ci : d.ci
+                                    `ifdef compressed ,instr16: d.instr16, hi:unpack(d.pc[1]) `endif };
+                v_reg_btb_tag[s][w]   <= BTBTag{tag: tag, valid: True};
+              end
+            end
+          end
+        end
+
+        // 4. Safely update allocation pointer locally
+        if (set_match && !isValid(local_hit_idx)) begin
+          rg_allocate[s] <= rg_allocate[s] + 1;
+        end
       end
 
       // we use the ghr version before the prediction to train the BHT
       if(d.ci == Branch) begin
+        // TIMING OPTIMIZATION STRIDE 1: Compute mispredict immediately from input data.
+        // This isolates it from the heavy downstream BTB and TAGE priority routing chains.
+        Bool predicted_taken = unpack(d.final_pred[`statesize-1]);
+        Bool mispredict = (predicted_taken != d.actual_taken);
+        
+        Bool actual_taken = d.actual_taken;
         Bit#(`histlen) old_ghr = d.history << 1; 
         let hi_bank = d.pc[1];
 
@@ -560,88 +661,88 @@ package u_tage_lp;
             original_provider_state = ent1.state;
         end
 
-        Bool actual_taken = d.actual_taken;
-        Bool predicted_taken = unpack(d.final_pred[`statesize-1]);
-        Bool mispredict = (predicted_taken != actual_taken);
-
         // --- LOOP PREDICTOR TRAINING ---
         Bit#(TSub#(`vaddr, `ignore)) lp_tag = truncate(d.pc >> `ignore);
-        Maybe#(Bit#(TLog#(`LOOP_ENTRIES))) maybe_lp_idx = tagged Invalid;
-        
+
+        // 1. Merged Victim Allocation Scan
+        Maybe#(Bit#(TLog#(`LOOP_ENTRIES))) victim_idx = tagged Invalid;
         for(Integer i = 0; i < `LOOP_ENTRIES; i = i + 1) begin
-            if(v_reg_loop_table[i][1].valid && v_reg_loop_table[i][1].tag == lp_tag)
-                maybe_lp_idx = tagged Valid fromInteger(i);
+            let ent = v_reg_loop_table[i][1];
+            Bool is_evictable = !ent.valid || (ent.confidence == 0);
+            if (is_evictable && !isValid(victim_idx)) begin
+                victim_idx = tagged Valid fromInteger(i);
+            end
         end
 
-        if(maybe_lp_idx matches tagged Valid .idx &&& d.ci == Branch) begin
-            let ent = v_reg_loop_table[idx][1];
-            // Determine if history is valid based on your signed index sentinel (-1)
-            Bool history_valid = (d.lp_hist.idx >= 0);
-            // 1. Evaluate Confidence & Trip Counts
-            if(actual_taken != unpack(ent.direction)) begin // Loop Exit
-                if(history_valid && (d.lp_hist.count + 1 == ent.trip_count)) begin
-                    ent.confidence = (ent.confidence < `LOOP_CONF_MAX) ? ent.confidence + 1 : ent.confidence;
-                end else if (history_valid) begin
-                    ent.trip_count = d.lp_hist.count + 1; // Real trip count calculation!
-                    ent.confidence = (ent.confidence > 0) ? ent.confidence - 1 : 0;
-                end
-                ent.iter_count = 0;
-            end
-            else begin // Loop Continues
-                if(history_valid && ent.trip_count > 0 && d.lp_hist.count >= ent.trip_count) begin
-                    ent.confidence = (ent.confidence > 0) ? ent.confidence - 1 : 0;
-                end
-            end
+        // =================================================================
+        // 2. PURE UPDATE LOOP (No Allocation Logic Inside)
+        // =================================================================
+        Bool hit_anywhere = False;
 
-            // 2. Structural Fix: Recover iter_count based on True Architectural Outcome
-            if(actual_taken != unpack(ent.direction)) begin
-                ent.iter_count = 0; // Loop physically ended -> Reset to 0 for next invocation
-            end else begin
-                if(mispredict) begin
-                    ent.iter_count = d.lp_hist.count + 1; // Mispredicted exit -> Restore correct next iteration
-                end else begin
-                    let live_ent = v_reg_loop_table[idx][1]; // Predicted correctly -> Retain front-end speculative value
-                    ent.iter_count = live_ent.iter_count;
-                end
-            end
+        for(Integer i = 0; i < `LOOP_ENTRIES; i = i + 1) begin
+            let current_entry = v_reg_loop_table[i][1];
+            Bool is_hit = (current_entry.valid && current_entry.tag == lp_tag && d.ci == Branch);
 
-            v_reg_loop_table[idx][1] <= ent;
-        end 
-        else if (mispredict) begin 
-            // 2. SEARCH for a "weak" victim
-            Vector#(`LOOP_ENTRIES, LoopEntry) v_loop_snapshot;
-            for(Integer i = 0; i < `LOOP_ENTRIES; i = i + 1)
-                v_loop_snapshot[i] = v_reg_loop_table[i][1];
-
-            let victim_idx = findIndex(is_evictable, v_loop_snapshot);
-            
-            // 3. ONLY replace if a victim was found
-            if (victim_idx matches tagged Valid .v) begin
-                Bit#(TLog#(`LOOP_ENTRIES)) alloc_ptr = pack(v);
-                Bit#(1) body_dir = (d.target < d.pc) ? 1'b1 : 1'b0;
+            if (is_hit) begin
+                hit_anywhere = True; // Blocks duplicates downstream
+                let updated_hit_entry = current_entry;
+                Bool history_valid = (d.lp_hist.idx >= 0);
                 
-                v_reg_loop_table[alloc_ptr][1] <= LoopEntry{
-                    tag: lp_tag, 
-                    trip_count: 0, 
-                    iter_count: 0, 
-                    confidence: 0, 
-                    direction: body_dir, 
-                    valid: True
-                };
-            end 
-            else begin
-                // Trigger a "Decay" to make room for future allocations.
-                for(Integer i = 0; i < `LOOP_ENTRIES; i = i + 1) begin
-                    let ent = v_reg_loop_table[i][1];
-                    if(ent.confidence > 0) begin
-                        ent.confidence = ent.confidence - 1;
-                        v_reg_loop_table[i][1] <= ent;
+                if(actual_taken != unpack(current_entry.direction)) begin 
+                    if(history_valid && (d.lp_hist.count + 1 == current_entry.trip_count)) begin
+                        updated_hit_entry.confidence = (current_entry.confidence < `LOOP_CONF_MAX) ? current_entry.confidence + 1 : current_entry.confidence;
+                    end else if (history_valid) begin
+                        updated_hit_entry.trip_count = d.lp_hist.count + 1;
+                        updated_hit_entry.confidence = (current_entry.confidence > 0) ? current_entry.confidence - 1 : 0;
+                    end
+                    updated_hit_entry.iter_count = 0;
+                end
+                else begin 
+                    if(history_valid && current_entry.trip_count > 0 && d.lp_hist.count >= current_entry.trip_count) begin
+                        updated_hit_entry.confidence = (current_entry.confidence > 0) ? current_entry.confidence - 1 : 0;
                     end
                 end
-                `logLevel(bpu, 4, $format("[%2d]BPU : LP Table Full. Decaying confidence.", hartid))
+
+                if(actual_taken != unpack(current_entry.direction)) begin
+                    updated_hit_entry.iter_count = 0; 
+                end else if (mispredict) begin
+                    updated_hit_entry.iter_count = d.lp_hist.count + 1; 
+                end
+                
+                v_reg_loop_table[i][1] <= updated_hit_entry;
             end
         end
 
+        // =================================================================
+        // 3. STATIC ALLOCATION & DECAY LOOP (NO MULTIPLEXER EXPLOSION)
+        // =================================================================
+        if (mispredict && !hit_anywhere) begin
+            for(Integer i = 0; i < `LOOP_ENTRIES; i = i + 1) begin
+                Bit#(TLog#(`LOOP_ENTRIES)) u_idx = fromInteger(i);
+                let current_entry = v_reg_loop_table[i][1];
+
+                // Static matching: Each row independently checks if it's the chosen victim
+                if (victim_idx matches tagged Valid .v &&& u_idx == v) begin
+                    Bit#(1) body_dir = (d.target < d.pc) ? 1'b1 : 1'b0;
+                    v_reg_loop_table[i][1] <= LoopEntry{
+                        tag: lp_tag, 
+                        trip_count: 0, 
+                        iter_count: 0, 
+                        confidence: 0, 
+                        direction: body_dir, 
+                        valid: True
+                    };
+                end 
+                // If table is entirely full, decay entries to make room later
+                else if (!isValid(victim_idx)) begin
+                    if(current_entry.confidence > 0) begin
+                        let updated_decay_entry = current_entry;
+                        updated_decay_entry.confidence = current_entry.confidence - 1;
+                        v_reg_loop_table[i][1] <= updated_decay_entry;
+                    end
+                end
+            end
+        end
         // --- TAGE UPDATE LOGIC ---
         if(d.btbhit) begin
           Bit#(`statesize) next_tage_state;
@@ -688,4 +789,404 @@ package u_tage_lp;
   endmodule
 endpackage
 
+//  method ActionValue#(PredictionResponse) mav_prediction_response (PredictionRequest r)
+//                                                          `ifdef ifence if(!rg_initialize) `endif ;
+//       `logLevel( bpu, 0, $format("[%2d]BPU : Received Request: ",hartid, fshow(r),
+//                                  " ghr:%h",hartid,rg_ghr[0]))
+//     `ifdef ifence
+//       if( r.fence && wr_bpu_enable)
+//         rg_initialize <= True;
+//     `endif
+//       Bit#(`statesize) branch_state_ [`bhtcols];
 
+//       Bit#(`statesize) prediction_ = 1;
+//       Bit#(`vaddr) target_ = r.pc;
+//       Bool hit = False;
+//       Bit#(`histlen) lv_ghr = rg_ghr[0];
+//       Bool hi = False;
+//     `ifdef compressed
+//       Bool instr16 = False;
+//     `endif
+
+//       Bit#(1) lp_taken = 0;
+//       LoopHistory lv_lp_hist = LoopHistory { idx: -1, count: 0 };
+
+//       if(!r.fence && wr_bpu_enable) begin
+//         let shifted_pc = r.pc >> `ignore;
+//         Bit#(TLog#(NUM_SETS)) index = shifted_pc[valueOf(TLog#(NUM_SETS))-1:0];
+//         Bit#(TSub#(`vaddr, TAdd#(TLog#(NUM_SETS), `ignore))) tag = truncateLSB(r.pc);
+
+//         Vector#(`WAYS, Bool) match_;
+//         for(Integer i = 0; i < `WAYS; i = i + 1)
+//           match_[i] = (v_reg_btb_tag[index][i].tag == tag && v_reg_btb_tag[index][i].valid);
+
+//         let match_bits = pack(match_);
+//         hit = unpack(|match_bits);
+//         let hit_entry = select(readVReg(v_reg_btb_entry[index]), unpack(match_bits));
+
+//         if(hit) begin
+//           `logLevel( bpu, 1, $format("[%2d]BPU : BTB Hit: ",hartid,fshow(hit_entry)))
+//         end
+
+//         `ifdef compressed
+//           instr16 = hit_entry.instr16;
+//           hi = hit_entry.hi;
+//         `endif
+
+//         Bit#(TSub#(`vaddr, `ignore)) lp_tag = truncate(r.pc >> `ignore);
+
+//         // =================================================================
+//         // PASS 1: PURE READ & OVERRIDE GENERATION (FEED-FORWARD ONLY)
+//         // =================================================================
+//         Bool lp_override_active = False;
+//         Bit#(`statesize) lp_override_pred = 1;
+//         Bit#(1) lp_override_taken = 0;
+
+//         for(Integer i = 0; i < `LOOP_ENTRIES; i = i + 1) begin
+//             let ent = v_reg_loop_table[i][0];
+//             Bool is_lp_match = (ent.valid && ent.tag == lp_tag);
+
+//             if (is_lp_match) begin
+//                 lv_lp_hist.idx = fromInteger(i);
+//                 lv_lp_hist.count = ent.iter_count;
+
+//                 if(ent.trip_count > 0 && ent.confidence == `LOOP_CONF_MAX) begin
+//                     lp_override_active = True;
+//                     Bit#(1) predicted_dir = (ent.iter_count == ent.trip_count - 1) ? ~ent.direction : ent.direction;
+//                     lp_override_taken = predicted_dir;
+//                     lp_override_pred  = {predicted_dir, 1'b1};
+//                 end
+//             end
+//         end
+
+//         // =================================================================
+//         // PASS 2: ISOLATED LOCALIZED WRITE-BACK (NO CROSS-ROW COUPLING)
+//         // =================================================================
+//         for(Integer i = 0; i < `LOOP_ENTRIES; i = i + 1) begin
+//             let ent = v_reg_loop_table[i][0];
+//             Bool is_lp_match = (ent.valid && ent.tag == lp_tag);
+
+//             if (hit && hit_entry.ci == Branch && is_lp_match) begin
+//                 let updated_ent = ent;
+                
+//                 if(ent.trip_count > 0 && ent.confidence == `LOOP_CONF_MAX) begin
+//                     Bit#(1) predicted_dir = (ent.iter_count == ent.trip_count - 1) ? ~ent.direction : ent.direction;
+//                     if (predicted_dir == ent.direction)
+//                         updated_ent.iter_count = ent.iter_count + 1;
+//                     else
+//                         updated_ent.iter_count = 0;
+//                 end 
+//                 else begin
+//                     // FIXES THE 6.43% ACCURACY BUG: 
+//                     // Restores speculative fetch tracking for loops in training phase
+//                     // by assuming the loop follows its body direction.
+//                     updated_ent.iter_count = ent.iter_count + 1;
+//                 end
+                
+//                 v_reg_loop_table[i][0] <= updated_ent;
+//             end
+//         end
+
+//         // =================================================================
+//         // STANDARD BTB TARGET & TAGE LOOKUP
+//         // =================================================================
+//         if(hit) begin
+//         `ifdef bpu_ras
+//           `ifdef compressed
+//             Bit#(`vaddr) ras_push_offset = hit_entry.hi? hit_entry.instr16? r.discard? 2: 4
+//                                                                           : r.discard? 4: 6
+//                                                        : hit_entry.instr16? 2: 4;
+//           `else
+//             Bit#(`vaddr) ras_push_offset = 4;
+//           `endif
+//         if(True `ifdef compressed && ( hit_entry.hi || !r.discard ) `endif ) begin
+//           if(hit_entry.ci == Call)begin 
+//             Bit#(`vaddr) push_pc = r.pc + ras_push_offset;
+//             `logLevel( bpu, 1, $format("[%2d]BPU: Pushing1 to RAS:%h",hartid,(push_pc)))
+//             ras_stack.push(push_pc);
+//           end
+
+//           if(hit_entry.ci == Ret) begin 
+//             target_ = ras_stack.top;
+//             ras_stack.pop;
+//             `logLevel( bpu, 1, $format("[%2d]BPU: Choosing from top RAS:%h",hartid,target_))
+//           end
+//           else
+//         `endif
+//           target_ = hit_entry.target;
+
+//             if(hit_entry.ci == Ret ||  hit_entry.ci == Call || hit_entry.ci == JAL )
+//                prediction_ = 3;
+
+//             if(hit_entry.ci == Branch) begin
+//               let idx0 = fn_get_index(rg_ghr[0], r.pc, 0);
+//               let idx1 = fn_get_index(rg_ghr[0], r.pc, 10);
+//               let idx2 = fn_get_index(rg_ghr[0], r.pc, 20);
+//               let idx3 = fn_get_index(rg_ghr[0], r.pc, 40);
+
+//               let tag1 = fn_get_tag(rg_ghr[0], r.pc, 10);
+//               let tag2 = fn_get_tag(rg_ghr[0], r.pc, 20);
+//               let tag3 = fn_get_tag(rg_ghr[0], r.pc, 40);
+
+//               let ent1 = rf_tagged_1[pack(hi)].sub(idx1);
+//               let ent2 = rf_tagged_2[pack(hi)].sub(idx2);
+//               let ent3 = rf_tagged_3[pack(hi)].sub(idx3);
+
+//               if(ent3.valid && ent3.tag == tag3)
+//                 prediction_ = ent3.state;
+//               else if(ent2.valid && ent2.tag == tag2)
+//                 prediction_ = ent2.state;
+//               else if(ent1.valid && ent1.tag == tag1)
+//                 prediction_ = ent1.state;
+//               else
+//                 prediction_ = rg_bht_base[pack(hi)].sub(idx0);
+              
+//               Bit#(1) tage_taken = prediction_[`statesize - 1];
+
+//               // Safely apply the Loop Predictor Override downstream
+//               if (lp_override_active) begin
+//                   prediction_ = lp_override_pred;
+//                   tage_taken  = lp_override_taken;
+//               end
+                
+//               lv_ghr = {tage_taken, truncateLSB(rg_ghr[0])};
+//               `logLevel( bpu, 0, $format("[%2d]BPU : New GHR:%h",hartid, lv_ghr))
+//             end
+//           end
+//         end
+//       `ifdef ifence if(!r.fence) `endif
+//           rg_ghr[0] <= lv_ghr;
+
+//         `ifdef ASSERT
+//           dynamicAssert(countOnes(match_bits) < 2, "Multiple Matches in BTB");
+//         `endif
+//       end
+
+//       let btbresponse = BTBResponse{prediction: prediction_, btbhit: hit
+//                         `ifdef compressed , hi: hi `endif
+//                         `ifdef gshare , history : lv_ghr`endif };
+
+//       return PredictionResponse{ nextpc : target_, btbresponse: btbresponse,
+//                                 `ifdef compressed instr16 : instr16, `endif
+//                                 lp_hist: lv_lp_hist};
+//     endmethod
+
+//     /*doc:method: This method is called for all unconditional and conditional jumps.
+//     Using the pc of the instruction we first compute the BTB index and tag. The index selects the 
+//     BTB set and the tag is used to match entries within that set. If an entry already exists in the 
+//     indexed set (tag match and valid bit set), then the entry is updated with a new/same target 
+//     from the execute stage.
+
+//     If the entry does not exist, then a new entry is allotted in the BTB set depending on the 
+//     rg_allocate[set_idx] value. This acts as a per-set allocation pointer for replacement among the WAYS.
+
+//     Additionally in case of conditional branches, the bht is again indexed using the pc and the ghr.
+//     This entry is updated only if the BTB was a hit during prediction i.e. only on the second
+//     instance of the branch the bht gets updated.
+
+//     It was first thought to be better to send the btbindex along the pipe to reduce the additional
+//     look-up hw here. However, for really small loops its possible that while training for an entry
+//     in a cycle, the same instruction is getting predicted again. This will cause a miss in the
+//     prediction and the training of the second instance would lead to allocating a new entry. This
+//     would lead to duplicates and thus would require zapping them - another simultaneous look-up. It
+//     seems the current approach does to seem close on required frequencies.
+//     */
+//     method Action ma_train_bpu (Training_data d) if(wr_bpu_enable
+//                                                           `ifdef ifence && !rg_initialize `endif );
+//       `logLevel( bpu, 4, $format("[%2d]BPU : Received Training: ",hartid,fshow(d)))
+
+//       let shifted_pc = d.pc >> `ignore;
+//       Bit#(TLog#(NUM_SETS)) set_idx = shifted_pc[valueOf(TLog#(NUM_SETS))-1:0];
+//       Bit#(TSub#(`vaddr, TAdd#(TLog#(NUM_SETS), `ignore))) tag = truncateLSB(d.pc);
+
+//       // STATIC PARALLEL LOCALIZATION: Completely eliminates 2D Mux/Demux trees
+//       for (Integer s = 0; s < valueOf(NUM_SETS); s = s + 1) begin
+//         Bit#(TLog#(NUM_SETS)) current_set = fromInteger(s);
+//         Bool set_match = (set_idx == current_set);
+
+//         // 1. Statically look up hits inside this specific set
+//         Maybe#(Bit#(TLog#(`WAYS))) local_hit_idx = tagged Invalid;
+//         for (Integer w = 0; w < valueOf(`WAYS); w = w + 1) begin
+//           let tag_val = v_reg_btb_tag[s][w];
+//           if (tag_val.tag == tag && tag_val.valid) begin
+//             local_hit_idx = tagged Valid fromInteger(w);
+//           end
+//         end
+
+//         // 2. Fetch allocation pointer for this set
+//         Bit#(TLog#(`WAYS)) alloc_way = rg_allocate[s];
+
+//         // 3. Update arrays locally per register element
+//         for (Integer w = 0; w < valueOf(`WAYS); w = w + 1) begin
+//           Bit#(TLog#(`WAYS)) current_way = fromInteger(w);
+
+//           if (set_match) begin
+//             if (local_hit_idx matches tagged Valid .h) begin
+//               // If it's a hit, only update the matching way
+//               if (h == current_way) begin
+//                 v_reg_btb_entry[s][w] <= BTBEntry{ target : d.target, ci : d.ci
+//                                     `ifdef compressed ,instr16: d.instr16, hi:unpack(d.pc[1]) `endif };
+//               end
+//             end
+//             else begin
+//               // If it's a miss, only update the allocated way
+//               if (alloc_way == current_way) begin
+//                 v_reg_btb_entry[s][w] <= BTBEntry{ target : d.target, ci : d.ci
+//                                     `ifdef compressed ,instr16: d.instr16, hi:unpack(d.pc[1]) `endif };
+//                 v_reg_btb_tag[s][w]   <= BTBTag{tag: tag, valid: True};
+//               end
+//             end
+//           end
+//         end
+
+//         // 4. Safely update allocation pointer locally
+//         if (set_match && !isValid(local_hit_idx)) begin
+//           rg_allocate[s] <= rg_allocate[s] + 1;
+//         end
+//       end
+
+//       // we use the ghr version before the prediction to train the BHT
+//       if(d.ci == Branch) begin
+//         // TIMING OPTIMIZATION STRIDE 1: Compute mispredict immediately from input data.
+//         // This isolates it from the heavy downstream BTB and TAGE priority routing chains.
+//         Bool predicted_taken = unpack(d.final_pred[`statesize-1]);
+//         Bool mispredict = (predicted_taken != d.actual_taken);
+        
+//         Bool actual_taken = d.actual_taken;
+//         Bit#(`histlen) old_ghr = d.history << 1; 
+//         let hi_bank = d.pc[1];
+
+//         // Re-identify the provider table that supplied the original prediction
+//         let idx0 = fn_get_index(old_ghr, d.pc, 0);
+//         let idx1 = fn_get_index(old_ghr, d.pc, 10);
+//         let idx2 = fn_get_index(old_ghr, d.pc, 20);
+//         let idx3 = fn_get_index(old_ghr, d.pc, 40);
+
+//         let t1 = fn_get_tag(old_ghr, d.pc, 10);
+//         let t2 = fn_get_tag(old_ghr, d.pc, 20);
+//         let t3 = fn_get_tag(old_ghr, d.pc, 40);
+
+//         let ent1 = rf_tagged_1[hi_bank].sub(idx1);
+//         let ent2 = rf_tagged_2[hi_bank].sub(idx2);
+//         let ent3 = rf_tagged_3[hi_bank].sub(idx3);
+
+//         Integer provider = 0;
+//         Bit#(`statesize) original_provider_state = rg_bht_base[hi_bank].sub(idx0); 
+        
+//         if (ent3.valid && ent3.tag == t3) begin
+//             provider = 3;
+//             original_provider_state = ent3.state;
+//         end else if (ent2.valid && ent2.tag == t2) begin
+//             provider = 2;
+//             original_provider_state = ent2.state;
+//         end else if (ent1.valid && ent1.tag == t1) begin
+//             provider = 1;
+//             original_provider_state = ent1.state;
+//         end
+
+//         // --- LOOP PREDICTOR TRAINING ---
+//         Bit#(TSub#(`vaddr, `ignore)) lp_tag = truncate(d.pc >> `ignore);
+
+//         // 1. Merged Victim Allocation Scan
+//         Maybe#(Bit#(TLog#(`LOOP_ENTRIES))) victim_idx = tagged Invalid;
+//         for(Integer i = 0; i < `LOOP_ENTRIES; i = i + 1) begin
+//             let ent = v_reg_loop_table[i][1];
+//             Bool is_evictable = !ent.valid || (ent.confidence == 0);
+//             if (is_evictable && !isValid(victim_idx)) begin
+//                 victim_idx = tagged Valid fromInteger(i);
+//             end
+//         end
+
+//         // =================================================================
+//         // 2. PURE UPDATE LOOP (No Allocation Logic Inside)
+//         // =================================================================
+//         Bool hit_anywhere = False;
+
+//         for(Integer i = 0; i < `LOOP_ENTRIES; i = i + 1) begin
+//             let current_entry = v_reg_loop_table[i][1];
+//             Bool is_hit = (current_entry.valid && current_entry.tag == lp_tag && d.ci == Branch);
+
+//             if (is_hit) begin
+//                 hit_anywhere = True; // Blocks duplicates downstream
+//                 let updated_hit_entry = current_entry;
+//                 Bool history_valid = (d.lp_hist.idx >= 0);
+                
+//                 if(actual_taken != unpack(current_entry.direction)) begin 
+//                     if(history_valid && (d.lp_hist.count + 1 == current_entry.trip_count)) begin
+//                         updated_hit_entry.confidence = (current_entry.confidence < `LOOP_CONF_MAX) ? current_entry.confidence + 1 : current_entry.confidence;
+//                     end else if (history_valid) begin
+//                         updated_hit_entry.trip_count = d.lp_hist.count + 1;
+//                         updated_hit_entry.confidence = (current_entry.confidence > 0) ? current_entry.confidence - 1 : 0;
+//                     end
+//                     updated_hit_entry.iter_count = 0;
+//                 end
+//                 else begin 
+//                     if(history_valid && current_entry.trip_count > 0 && d.lp_hist.count >= current_entry.trip_count) begin
+//                         updated_hit_entry.confidence = (current_entry.confidence > 0) ? current_entry.confidence - 1 : 0;
+//                     end
+//                 end
+
+//                 if(actual_taken != unpack(current_entry.direction)) begin
+//                     updated_hit_entry.iter_count = 0; 
+//                 end else if (mispredict) begin
+//                     updated_hit_entry.iter_count = d.lp_hist.count + 1; 
+//                 end
+                
+//                 v_reg_loop_table[i][1] <= updated_hit_entry;
+//             end
+//         end
+
+//         // =================================================================
+//         // 3. STATIC ALLOCATION & DECAY LOOP (NO MULTIPLEXER EXPLOSION)
+//         // =================================================================
+//         if (mispredict && !hit_anywhere) begin
+//             for(Integer i = 0; i < `LOOP_ENTRIES; i = i + 1) begin
+//                 Bit#(TLog#(`LOOP_ENTRIES)) u_idx = fromInteger(i);
+//                 let current_entry = v_reg_loop_table[i][1];
+
+//                 // Static matching: Each row independently checks if it's the chosen victim
+//                 if (victim_idx matches tagged Valid .v &&& u_idx == v) begin
+//                     Bit#(1) body_dir = (d.target < d.pc) ? 1'b1 : 1'b0;
+//                     v_reg_loop_table[i][1] <= LoopEntry{
+//                         tag: lp_tag, 
+//                         trip_count: 0, 
+//                         iter_count: 0, 
+//                         confidence: 0, 
+//                         direction: body_dir, 
+//                         valid: True
+//                     };
+//                 end 
+//                 // If table is entirely full, decay entries to make room later
+//                 else if (!isValid(victim_idx)) begin
+//                     if(current_entry.confidence > 0) begin
+//                         let updated_decay_entry = current_entry;
+//                         updated_decay_entry.confidence = current_entry.confidence - 1;
+//                         v_reg_loop_table[i][1] <= updated_decay_entry;
+//                     end
+//                 end
+//             end
+//         end
+//         // --- TAGE UPDATE LOGIC ---
+//         if(d.btbhit) begin
+//           Bit#(`statesize) next_tage_state;
+//           if (actual_taken) 
+//               next_tage_state = (original_provider_state == 3) ? 3 : original_provider_state + 1;
+//           else 
+//               next_tage_state = (original_provider_state == 0) ? 0 : original_provider_state - 1;
+//           // Update the state of the provider table with the actual state computed by the Execute stage
+//           if(provider == 3) rf_tagged_3[hi_bank].upd(idx3, TaggedEntry{state: next_tage_state, tag: t3, valid: True});
+//           else if(provider == 2) rf_tagged_2[hi_bank].upd(idx2, TaggedEntry{state: next_tage_state, tag: t2, valid: True});
+//           else if(provider == 1) rf_tagged_1[hi_bank].upd(idx1, TaggedEntry{state: next_tage_state, tag: t1, valid: True});
+//           else rg_bht_base[hi_bank].upd(idx0, next_tage_state);
+          
+//           if(mispredict && provider < 3) begin
+//             // Initialize new entry to weakly taken (2) or weakly not-taken (1)
+//             Bit#(`statesize) init_st = actual_taken ? 2 : 1;
+            
+//             if(provider == 0) rf_tagged_1[hi_bank].upd(idx1, TaggedEntry{state: init_st, tag: t1, valid: True});
+//             else if(provider == 1) rf_tagged_2[hi_bank].upd(idx2, TaggedEntry{state: init_st, tag: t2, valid: True});
+//             else if(provider == 2) rf_tagged_3[hi_bank].upd(idx3, TaggedEntry{state: init_st, tag: t3, valid: True});
+//           end
+//         end
+//       end
+//     endmethod
